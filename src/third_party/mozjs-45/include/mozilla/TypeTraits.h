@@ -9,6 +9,16 @@
 #ifndef mozilla_TypeTraits_h
 #define mozilla_TypeTraits_h
 
+/*
+ * MONGO MODIFICATION - 修复 glibc 2.25+ 兼容性问题
+ * 新版 glibc 的 sys/types.h 可能在 extern "C" 块中被包含
+ * 这会导致后续的 C++ 模板代码编译失败
+ * 解决方案：确保在包含任何系统头文件前，先包含可能引入 extern "C" 的头文件
+ */
+#ifdef __cplusplus
+extern "C++" {
+#endif
+
 #include "mozilla/Types.h"
 
 /*
@@ -1212,5 +1222,9 @@ class Decay
 };
 
 } /* namespace mozilla */
+
+#ifdef __cplusplus
+} /* extern "C++" */
+#endif
 
 #endif /* mozilla_TypeTraits_h */

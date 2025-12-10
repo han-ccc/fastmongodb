@@ -35,6 +35,7 @@
 #include <boost/filesystem/operations.hpp>
 #include <boost/filesystem/path.hpp>
 #include <fstream>
+#include <sys/sysmacros.h>
 
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/storage/mmap_v1/data_file_sync.h"
