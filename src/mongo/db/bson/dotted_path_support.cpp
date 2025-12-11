@@ -32,6 +32,7 @@
 
 #include <cctype>
 #include <string>
+#include <unordered_map>
 
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -45,6 +46,34 @@ namespace {
 
 const BSONObj kNullObj = BSON("" << BSONNULL);
 const BSONElement kNullElt = kNullObj.firstElement();
+
+/**
+ * P1优化: 字段提取缓存
+ *
+ * 问题: 插入N个索引的文档时，同一字段会被提取N次
+ * 方案: 缓存字段提取结果，同一文档的重复提取直接返回缓存
+ */
+struct FieldExtractionCache {
+    const char* docData = nullptr;
+
+    struct CacheEntry {
+        BSONElement element;
+        size_t pathConsumed;  // path被消费的长度
+    };
+    std::unordered_map<std::string, CacheEntry> cache;
+
+    void checkDocument(const char* newDocData) {
+        if (docData != newDocData) {
+            docData = newDocData;
+            cache.clear();
+        }
+    }
+
+    static FieldExtractionCache& instance() {
+        thread_local FieldExtractionCache inst;
+        return inst;
+    }
+};
 
 template <typename BSONElementColl>
 void _extractAllElementsAlongPath(const BSONObj& obj,
@@ -141,13 +170,14 @@ BSONElement extractElementAtPath(const BSONObj& obj, StringData path) {
     return e;
 }
 
-BSONElement extractElementAtPathOrArrayAlongPath(const BSONObj& obj, const char*& path) {
+// 内部实现（无缓存，用于递归调用）
+BSONElement _extractElementAtPathOrArrayAlongPathImpl(const BSONObj& obj, const char*& path) {
     const char* p = strchr(path, '.');
 
     BSONElement sub;
 
     if (p) {
-        sub = obj.getField(std::string(path, p - path));
+        sub = obj.getField(StringData(path, p - path));
         path = p + 1;
     } else {
         sub = obj.getField(path);
@@ -159,9 +189,42 @@ BSONElement extractElementAtPathOrArrayAlongPath(const BSONObj& obj, const char*
     else if (sub.type() == Array || path[0] == '\0')
         return sub;
     else if (sub.type() == Object)
-        return extractElementAtPathOrArrayAlongPath(sub.embeddedObject(), path);
+        return _extractElementAtPathOrArrayAlongPathImpl(sub.embeddedObject(), path);
     else
         return BSONElement();
+}
+
+BSONElement extractElementAtPathOrArrayAlongPath(const BSONObj& obj, const char*& path) {
+    // P1优化: 使用字段提取缓存（仅对嵌套路径有效）
+    // 对于顶层字段，缓存开销可能大于收益，直接执行
+
+    // 快速路径：检查是否为顶层字段（无嵌套）
+    const char* dot = strchr(path, '.');
+    if (!dot) {
+        // 顶层字段：直接提取，不使用缓存
+        BSONElement sub = obj.getField(path);
+        path = path + strlen(path);
+        return sub;
+    }
+
+    // 嵌套路径：使用缓存
+    auto& cache = FieldExtractionCache::instance();
+    cache.checkDocument(obj.objdata());
+
+    const char* originalPath = path;
+    std::string pathKey(originalPath);
+
+    auto it = cache.cache.find(pathKey);
+    if (it != cache.cache.end()) {
+        path = originalPath + it->second.pathConsumed;
+        return it->second.element;
+    }
+
+    BSONElement result = _extractElementAtPathOrArrayAlongPathImpl(obj, path);
+    size_t consumed = path - originalPath;
+    cache.cache[pathKey] = {result, consumed};
+
+    return result;
 }
 
 void extractAllElementsAlongPath(const BSONObj& obj,
