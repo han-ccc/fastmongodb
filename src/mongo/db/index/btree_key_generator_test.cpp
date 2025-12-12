@@ -1109,4 +1109,91 @@ TEST(BtreeKeyGeneratorTest, GetCollationAwareKeysFromNestedArray) {
         testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths, false, &collator));
 }
 
+//
+// P1优化测试: 简单字段缓存 (栈上数组，无thread_local，无map)
+//
+
+// 测试多个简单字段（无"."）的复合索引
+TEST(BtreeKeyGeneratorTest, P1OptimMultipleSimpleFields) {
+    BSONObj keyPattern = fromjson("{a: 1, b: 1, c: 1}");
+    BSONObj genKeysFrom = fromjson("{a: 1, b: 2, c: 3, d: 4}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 1, '': 2, '': 3}"));
+    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试简单字段和嵌套字段混合
+TEST(BtreeKeyGeneratorTest, P1OptimMixedSimpleAndDottedFields) {
+    BSONObj keyPattern = fromjson("{a: 1, 'b.c': 1, d: 1}");
+    BSONObj genKeysFrom = fromjson("{a: 10, b: {c: 20}, d: 30}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 10, '': 20, '': 30}"));
+    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试文档中字段顺序与索引不同
+TEST(BtreeKeyGeneratorTest, P1OptimFieldOrderDifferentFromIndex) {
+    BSONObj keyPattern = fromjson("{x: 1, y: 1, z: 1}");
+    BSONObj genKeysFrom = fromjson("{z: 300, other: 999, x: 100, y: 200}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 100, '': 200, '': 300}"));
+    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试缺失字段（应返回null）
+TEST(BtreeKeyGeneratorTest, P1OptimMissingSimpleField) {
+    BSONObj keyPattern = fromjson("{a: 1, b: 1, c: 1}");
+    BSONObj genKeysFrom = fromjson("{a: 1, c: 3}");  // 缺少 b
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 1, '': null, '': 3}"));
+    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试多字段索引 + 数组（验证不破坏数组展开逻辑）
+TEST(BtreeKeyGeneratorTest, P1OptimSimpleFieldsWithArray) {
+    BSONObj keyPattern = fromjson("{a: 1, b: 1}");
+    BSONObj genKeysFrom = fromjson("{a: [1, 2], b: 'fixed'}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 1, '': 'fixed'}"));
+    expectedKeys.insert(fromjson("{'': 2, '': 'fixed'}"));
+    MultikeyPaths expectedMultikeyPaths{{0U}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试类似业务场景的多字段索引
+TEST(BtreeKeyGeneratorTest, P1OptimBusinessLikeCompoundIndex) {
+    BSONObj keyPattern = fromjson("{userId: 1, status: 1, createTime: 1, orderNo: 1}");
+    BSONObj genKeysFrom = fromjson("{userId: 'u123', status: 1, createTime: 1700000000, "
+                                   "orderNo: 'ORD001', extra: 'ignored'}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 'u123', '': 1, '': 1700000000, '': 'ORD001'}"));
+    MultikeyPaths expectedMultikeyPaths{
+        std::set<size_t>{}, std::set<size_t>{}, std::set<size_t>{}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试空对象
+TEST(BtreeKeyGeneratorTest, P1OptimEmptyObject) {
+    BSONObj keyPattern = fromjson("{a: 1, b: 1}");
+    BSONObj genKeysFrom = fromjson("{}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': null, '': null}"));
+    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}, std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
+// 测试字段名前缀匹配问题（确保 "ab" 不会错误匹配 "a"）
+TEST(BtreeKeyGeneratorTest, P1OptimFieldNamePrefixNoFalseMatch) {
+    BSONObj keyPattern = fromjson("{a: 1}");
+    BSONObj genKeysFrom = fromjson("{ab: 999, abc: 888, a: 100}");
+    BSONObjSet expectedKeys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
+    expectedKeys.insert(fromjson("{'': 100}"));
+    MultikeyPaths expectedMultikeyPaths{std::set<size_t>{}};
+    ASSERT(testKeygen(keyPattern, genKeysFrom, expectedKeys, expectedMultikeyPaths));
+}
+
 }  // namespace

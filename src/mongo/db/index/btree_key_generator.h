@@ -258,6 +258,16 @@ private:
     // Null if this key generator orders strings according to the simple binary compare. If
     // non-null, represents the collator used to generate index keys for indexed strings.
     const CollatorInterface* _collator;
+
+    // 阶段1优化: 简单字段（无"."的顶层字段）长度位图预过滤
+    // 用于快速跳过不可能匹配的文档字段
+    struct SimpleFieldInfo {
+        size_t fieldIndex;  // 在_fieldNames中的索引
+        size_t nameLen;     // 字段名长度
+        const char* name;   // 字段名指针
+    };
+    std::vector<SimpleFieldInfo> _simpleFields;
+    uint64_t _simpleLengthBitmap = 0;  // 位i=1表示存在长度为i的简单字段
 };
 
 }  // namespace mongo

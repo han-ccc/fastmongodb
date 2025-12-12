@@ -29,6 +29,7 @@
 #include "mongo/db/index/btree_key_generator.h"
 
 #include <boost/optional.hpp>
+#include <cstring>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/bson/dotted_path_support.h"
@@ -241,10 +242,20 @@ BtreeKeyGeneratorV1::BtreeKeyGeneratorV1(std::vector<const char*> fieldNames,
     : BtreeKeyGenerator(fieldNames, fixed, isSparse),
       _emptyPositionalInfo(fieldNames.size()),
       _collator(collator) {
-    for (const char* fieldName : fieldNames) {
+    for (size_t i = 0; i < fieldNames.size(); ++i) {
+        const char* fieldName = fieldNames[i];
         size_t pathLength = FieldRef{fieldName}.numParts();
         invariant(pathLength > 0);
         _pathLengths.push_back(pathLength);
+
+        // 阶段1优化: 收集简单字段（无"."的顶层字段）
+        // 使用长度位图快速过滤 + 提前退出
+        if (std::strchr(fieldName, '.') == nullptr) {
+            size_t len = std::strlen(fieldName);
+            _simpleFields.push_back({i, len, fieldName});
+            // 设置长度位图（位i=1表示存在长度为i的字段）
+            _simpleLengthBitmap |= (1ULL << (len & 63));
+        }
     }
 }
 
@@ -339,6 +350,45 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
         return;
     }
 
+    // 阶段1优化: 长度位图预过滤 + 提前退出
+    // 一次遍历文档预填充简单字段，协程安全
+    if (!_simpleFields.empty()) {
+        size_t foundCount = 0;
+        const size_t targetCount = _simpleFields.size();
+
+        for (BSONObjIterator it(obj); it.more() && foundCount < targetCount; ) {
+            BSONElement e = it.next();
+            const size_t docFieldLen = e.fieldNameSize() - 1;  // 不含null终止符
+
+            // 长度位图快速过滤：不可能匹配的长度直接跳过
+            if (!(_simpleLengthBitmap & (1ULL << (docFieldLen & 63)))) {
+                continue;
+            }
+
+            const char* docFieldName = e.fieldName();
+
+            // 遍历需要的简单字段
+            for (const auto& info : _simpleFields) {
+                // 跳过已找到的字段
+                if (fieldNames[info.fieldIndex][0] == '\0') {
+                    continue;
+                }
+
+                if (info.nameLen == docFieldLen &&
+                    std::memcmp(info.name, docFieldName, docFieldLen) == 0) {
+                    // 找到匹配！
+                    // 关键：数组字段不能预填充，必须让后续逻辑处理数组展开
+                    if (e.type() != Array) {
+                        fixed[info.fieldIndex] = e;
+                        fieldNames[info.fieldIndex] = "";  // 标记为已处理
+                        foundCount++;
+                    }
+                    break;  // 一个文档字段最多匹配一个索引字段
+                }
+            }
+        }
+    }
+
     if (multikeyPaths) {
         invariant(multikeyPaths->empty());
         multikeyPaths->resize(fieldNames.size());
@@ -383,13 +433,14 @@ void BtreeKeyGeneratorV1::getKeysImplWithArray(
     std::vector<boost::optional<size_t>> arrComponents(fieldNames.size());
 
     bool mayExpandArrayUnembedded = true;
+
     for (size_t i = 0; i < fieldNames.size(); ++i) {
         if (*fieldNames[i] == '\0') {
+            // 已在getKeysImpl中预填充，或已处理
             continue;
         }
 
         bool arrayNestedArray;
-        // Extract element matching fieldName[ i ] from object xor array.
         BSONElement e =
             extractNextElement(obj, positionalInfo[i], &fieldNames[i], &arrayNestedArray);
 
