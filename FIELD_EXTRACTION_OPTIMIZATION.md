@@ -6,6 +6,43 @@
 ## 优化目标
 优化BtreeKeyGenerator的字段提取性能，减少文档遍历次数和字符串比较开销。
 
+---
+
+## 提交规范
+
+**每个MR最终提交前必须完成端到端基准测试。**
+
+### 验证流程
+
+1. **核心逻辑验证**: 编写独立benchmark验证算法可行性
+2. **代码实现**: 集成到MongoDB代码库
+3. **单元测试**: 确保所有测试通过
+4. **端到端基准测试**: 在mongod上运行`/tmp/crud_benchmark_v3.py`验证实际性能
+
+### 端到端基准测试步骤
+
+```bash
+# 1. 编译mongod
+scons mongod --disable-warnings-as-errors --js-engine=none -j24
+
+# 2. 启动mongod
+./mongod --storageEngine=rocksdb --dbpath=/tmp/mongo_data --port=27019 --fork --logpath=/tmp/mongod.log
+
+# 3. 运行基准测试
+python /tmp/crud_benchmark_v3.py
+
+# 4. 记录结果到本文档
+```
+
+### 基线指标
+
+| 操作 | 基线延迟 |
+|-----|---------|
+| INSERT (批量10) | ~1470us |
+| QUERY (点查) | ~247us |
+
+**注意**: 未完成端到端基准测试的优化不得合入主分支。
+
 ## 阶段规划
 
 | 阶段 | 方案 | 适用场景 | 预期效果 |
