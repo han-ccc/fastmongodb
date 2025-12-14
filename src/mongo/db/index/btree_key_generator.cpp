@@ -30,6 +30,7 @@
 
 #include <boost/optional.hpp>
 #include <cstring>
+#include <map>
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/db/bson/dotted_path_support.h"
@@ -242,6 +243,9 @@ BtreeKeyGeneratorV1::BtreeKeyGeneratorV1(std::vector<const char*> fieldNames,
     : BtreeKeyGenerator(fieldNames, fixed, isSparse),
       _emptyPositionalInfo(fieldNames.size()),
       _collator(collator) {
+    // 阶段2优化: 临时map用于收集前缀分组
+    std::map<std::string, std::vector<NestedFieldSuffix>> tempPrefixGroups;
+
     for (size_t i = 0; i < fieldNames.size(); ++i) {
         const char* fieldName = fieldNames[i];
         size_t pathLength = FieldRef{fieldName}.numParts();
@@ -250,11 +254,28 @@ BtreeKeyGeneratorV1::BtreeKeyGeneratorV1(std::vector<const char*> fieldNames,
 
         // 阶段1优化: 收集简单字段（无"."的顶层字段）
         // 使用长度位图快速过滤 + 提前退出
-        if (std::strchr(fieldName, '.') == nullptr) {
+        const char* dotPos = std::strchr(fieldName, '.');
+        if (dotPos == nullptr) {
             size_t len = std::strlen(fieldName);
             _simpleFields.push_back({i, len, fieldName});
             // 设置长度位图（位i=1表示存在长度为i的字段）
             _simpleLengthBitmap |= (1ULL << (len & 63));
+        } else {
+            // 阶段2优化: 嵌套字段，收集前缀分组
+            std::string prefix(fieldName, dotPos - fieldName);
+            std::string suffix(dotPos + 1);
+            tempPrefixGroups[prefix].push_back({i, suffix});
+        }
+    }
+
+    // 阶段2优化: 只保留有多个字段的前缀组（单字段组无优化收益）
+    for (auto& kv : tempPrefixGroups) {
+        if (kv.second.size() > 1) {
+            PrefixGroup group;
+            group.prefix = kv.first;
+            group.prefixLen = kv.first.size();
+            group.fields = std::move(kv.second);
+            _prefixGroups.push_back(std::move(group));
         }
     }
 }
@@ -384,6 +405,41 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
                         foundCount++;
                     }
                     break;  // 一个文档字段最多匹配一个索引字段
+                }
+            }
+        }
+    }
+
+    // 阶段2优化: 嵌套字段前缀分组
+    // 共享前缀的字段只查找前缀一次，减少重复遍历
+    for (const auto& group : _prefixGroups) {
+        // 查找前缀元素（如"a"）
+        BSONElement prefixElt = obj.getField(group.prefix);
+
+        // 如果前缀不存在或是数组，跳过（让默认逻辑处理）
+        if (prefixElt.eoo() || prefixElt.type() == Array) {
+            continue;
+        }
+
+        // 如果前缀是对象，从中提取所有后缀字段
+        if (prefixElt.type() == Object) {
+            BSONObj intermediateObj = prefixElt.embeddedObject();
+
+            for (const auto& field : group.fields) {
+                // 跳过已处理的字段
+                if (fieldNames[field.fieldIndex][0] == '\0') {
+                    continue;
+                }
+
+                // 在中间对象上提取后缀路径
+                const char* suffixPath = field.suffix.c_str();
+                BSONElement suffixElt = dps::extractElementAtPathOrArrayAlongPath(
+                    intermediateObj, suffixPath);
+
+                // 如果找到且不是数组，预填充
+                if (!suffixElt.eoo() && suffixElt.type() != Array && *suffixPath == '\0') {
+                    fixed[field.fieldIndex] = suffixElt;
+                    fieldNames[field.fieldIndex] = "";  // 标记为已处理
                 }
             }
         }

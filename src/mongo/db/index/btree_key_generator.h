@@ -268,6 +268,19 @@ private:
     };
     std::vector<SimpleFieldInfo> _simpleFields;
     uint64_t _simpleLengthBitmap = 0;  // 位i=1表示存在长度为i的简单字段
+
+    // 阶段2优化: 嵌套字段前缀分组
+    // 共享前缀的字段只遍历前缀一次，减少重复查找开销
+    struct NestedFieldSuffix {
+        size_t fieldIndex;       // 在_fieldNames中的索引
+        std::string suffix;      // 去掉前缀后的剩余路径（如"b"或"d.e"）
+    };
+    struct PrefixGroup {
+        std::string prefix;                     // 共享的前缀（如"a"）
+        size_t prefixLen;                       // 前缀长度
+        std::vector<NestedFieldSuffix> fields;  // 共享此前缀的字段
+    };
+    std::vector<PrefixGroup> _prefixGroups;  // 只包含有多个字段的前缀组
 };
 
 }  // namespace mongo
