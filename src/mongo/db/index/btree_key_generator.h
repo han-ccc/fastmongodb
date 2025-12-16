@@ -265,6 +265,7 @@ private:
         size_t fieldIndex;  // 在_fieldNames中的索引
         size_t nameLen;     // 字段名长度
         const char* name;   // 字段名指针
+        uint8_t cacheSlot;  // 阶段4v3: 字段名哈希映射的缓存槽位
     };
     std::vector<SimpleFieldInfo> _simpleFields;
     uint64_t _simpleLengthBitmap = 0;  // 位i=1表示存在长度为i的简单字段

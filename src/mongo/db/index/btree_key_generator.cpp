@@ -54,6 +54,28 @@ const BSONElement nullElt = nullObj.firstElement();
 const BSONObj undefinedObj = BSON("" << BSONUndefined);
 const BSONElement undefinedElt = undefinedObj.firstElement();
 
+// 阶段4v3: 线程局部字段偏移量缓存
+// 用于跨索引共享已提取的字段，避免重复遍历文档
+struct FieldOffsetCache {
+    const char* docPtr = nullptr;  // 当前缓存的文档指针
+    uint32_t offsets[256];         // 槽位 -> 字段在文档中的偏移量 (0=未缓存)
+
+    void reset(const char* newDocPtr) {
+        docPtr = newDocPtr;
+        std::memset(offsets, 0, sizeof(offsets));
+    }
+};
+thread_local FieldOffsetCache g_fieldCache;
+
+// 计算字段名的缓存槽位（构造时调用一次，运行时零开销）
+inline uint8_t computeCacheSlot(const char* name, size_t len) {
+    uint32_t hash = 0;
+    for (size_t i = 0; i < len; i++) {
+        hash = hash * 31 + static_cast<uint8_t>(name[i]);
+    }
+    return static_cast<uint8_t>(hash);
+}
+
 }  // namespace
 
 BtreeKeyGenerator::BtreeKeyGenerator(std::vector<const char*> fieldNames,
@@ -257,7 +279,9 @@ BtreeKeyGeneratorV1::BtreeKeyGeneratorV1(std::vector<const char*> fieldNames,
         const char* dotPos = std::strchr(fieldName, '.');
         if (dotPos == nullptr) {
             size_t len = std::strlen(fieldName);
-            _simpleFields.push_back({i, len, fieldName});
+            // 阶段4v3: 预计算缓存槽位，运行时零开销
+            uint8_t slot = computeCacheSlot(fieldName, len);
+            _simpleFields.push_back({i, len, fieldName, slot});
             // 设置长度位图（位i=1表示存在长度为i的字段）
             _simpleLengthBitmap |= (1ULL << (len & 63));
         } else {
@@ -371,10 +395,48 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
         return;
     }
 
+    // === 阶段4v3: 增量偏移量缓存 ===
+    // 检查缓存是否针对当前文档有效
+    const char* objData = obj.objdata();
+    bool cacheValid = (g_fieldCache.docPtr == objData);
+
+    if (!cacheValid) {
+        // 新文档，重置缓存
+        g_fieldCache.reset(objData);
+    }
+
+    // 阶段4v3: 先尝试从缓存获取字段（仅对后续索引有效）
+    size_t cacheHits = 0;
+    if (cacheValid && !_simpleFields.empty()) {
+        for (const auto& info : _simpleFields) {
+            // 跳过已处理的字段
+            if (fieldNames[info.fieldIndex][0] == '\0') {
+                continue;
+            }
+
+            uint32_t offset = g_fieldCache.offsets[info.cacheSlot];
+            if (offset != 0) {
+                // 缓存命中：从偏移量重建BSONElement
+                BSONElement cached(objData + offset);
+
+                // 校验字段名匹配（防止哈希冲突）
+                if (cached.fieldNameSize() - 1 == info.nameLen &&
+                    std::memcmp(cached.fieldName(), info.name, info.nameLen) == 0) {
+                    if (cached.type() != Array) {
+                        fixed[info.fieldIndex] = cached;
+                        fieldNames[info.fieldIndex] = "";
+                        cacheHits++;
+                    }
+                }
+            }
+        }
+    }
+
     // 阶段1优化: 长度位图预过滤 + 提前退出
-    // 一次遍历文档预填充简单字段，协程安全
-    if (!_simpleFields.empty()) {
-        size_t foundCount = 0;
+    // 对于简单字段（单层、非嵌套），使用长度预过滤快速匹配
+    // 跳过已被缓存命中的字段
+    if (!_simpleFields.empty() && cacheHits < _simpleFields.size()) {
+        size_t foundCount = cacheHits;
         const size_t targetCount = _simpleFields.size();
 
         for (BSONObjIterator it(obj); it.more() && foundCount < targetCount; ) {
@@ -395,14 +457,23 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
                     continue;
                 }
 
-                if (info.nameLen == docFieldLen &&
-                    std::memcmp(info.name, docFieldName, docFieldLen) == 0) {
+                // 长度必须匹配
+                if (info.nameLen != docFieldLen) {
+                    continue;
+                }
+
+                // 名称比较
+                if (std::memcmp(info.name, docFieldName, docFieldLen) == 0) {
                     // 找到匹配！
                     // 关键：数组字段不能预填充，必须让后续逻辑处理数组展开
                     if (e.type() != Array) {
                         fixed[info.fieldIndex] = e;
                         fieldNames[info.fieldIndex] = "";  // 标记为已处理
                         foundCount++;
+
+                        // 阶段4v3: 顺便填充缓存，供后续索引使用
+                        g_fieldCache.offsets[info.cacheSlot] =
+                            e.rawdata() - objData;
                     }
                     break;  // 一个文档字段最多匹配一个索引字段
                 }
@@ -413,7 +484,6 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
     // 阶段2优化: 嵌套字段前缀分组
     // 共享前缀的字段只查找前缀一次，减少重复遍历
     for (const auto& group : _prefixGroups) {
-        // 查找前缀元素（如"a"）
         BSONElement prefixElt = obj.getField(group.prefix);
 
         // 如果前缀不存在或是数组，跳过（让默认逻辑处理）
