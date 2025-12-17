@@ -652,6 +652,39 @@ private:
 
     mutable int totalSize; /* caches the computed size */
 
+    // 性能优化: 类型大小查找表 (来自MongoDB新版SERVER-86549)
+    // 提供O(1)时间获取固定类型的值大小，alignas(32)确保在单个缓存行内
+    // 值为类型的固定大小部分(不含类型字节和字段名)，0表示需要特殊处理
+    static constexpr uint8_t kFixedSizes alignas(32)[32] = {
+        0,   // 0x00 EOO - 特殊处理
+        8,   // 0x01 NumberDouble
+        0,   // 0x02 String - 变长(需读取4字节长度)
+        0,   // 0x03 Object - 变长(需读取4字节大小)
+        0,   // 0x04 Array - 变长(需读取4字节大小)
+        0,   // 0x05 BinData - 变长(需读取4字节长度+1子类型)
+        0,   // 0x06 Undefined
+        12,  // 0x07 ObjectID
+        1,   // 0x08 Bool
+        8,   // 0x09 Date
+        0,   // 0x0a Null
+        0,   // 0x0b Regex - 特殊处理(两个C字符串)
+        0,   // 0x0c DBRef - 变长
+        0,   // 0x0d Code - 变长
+        0,   // 0x0e Symbol - 变长
+        0,   // 0x0f CodeWScope - 变长
+        4,   // 0x10 NumberInt
+        8,   // 0x11 Timestamp
+        8,   // 0x12 NumberLong
+        16,  // 0x13 NumberDecimal
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  // 保留
+    };
+
+    // 变长类型掩码: 这些类型的值部分需要读取4字节长度前缀
+    static constexpr uint32_t kVariableSizeMask =
+        (1u << mongo::String) | (1u << Object) | (1u << mongo::Array) |
+        (1u << BinData) | (1u << DBRef) | (1u << Code) |
+        (1u << Symbol) | (1u << CodeWScope);
+
     friend class BSONObjIterator;
     friend class BSONObj;
     const BSONElement& chk(int t) const {

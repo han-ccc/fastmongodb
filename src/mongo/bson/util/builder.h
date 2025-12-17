@@ -44,6 +44,7 @@
 #include "mongo/base/string_data.h"
 #include "mongo/bson/bsontypes.h"
 #include "mongo/bson/inline_decls.h"
+#include "mongo/platform/bits.h"
 #include "mongo/platform/decimal128.h"
 #include "mongo/stdx/type_traits.h"
 #include "mongo/util/allocator.h"
@@ -320,9 +321,18 @@ private:
     }
     /* "slow" portion of 'grow()'  */
     void NOINLINE_DECL grow_reallocate(int minSize) {
-        int a = 64;
-        while (a < minSize)
-            a = a * 2;
+        // 性能优化: 使用位操作快速计算下一个2的幂次 (来自MongoDB新版SERVER-60137)
+        // 替代循环: while (a < minSize) a = a * 2;
+        // 使用countLeadingZeros可以O(1)计算，避免多次循环
+        int a;
+        if (minSize <= 64) {
+            a = 64;
+        } else {
+            // 计算不小于minSize的最小2的幂次
+            // 1ULL << (64 - clz(minSize - 1)) 给出正确的2的幂次
+            unsigned long long v = static_cast<unsigned long long>(minSize - 1);
+            a = static_cast<int>(1ULL << (64 - countLeadingZeros64(v)));
+        }
 
         if (a > BufferMaxSize) {
             std::stringstream ss;
