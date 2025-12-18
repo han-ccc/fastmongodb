@@ -30,6 +30,7 @@
 
 #include "mongo/s/shard_key_pattern.h"
 
+#include <atomic>
 #include <vector>
 
 #include "mongo/db/field_ref.h"
@@ -40,6 +41,7 @@
 #include "mongo/db/ops/path_support.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/util/mongoutils/str.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 
@@ -52,6 +54,48 @@ using std::vector;
 
 using pathsupport::EqualityMatches;
 using mongoutils::str::stream;
+
+// Performance statistics for shard key extraction
+namespace {
+struct ShardKeyExtractionStats {
+    std::atomic<uint64_t> fastPathCalls{0};
+    std::atomic<uint64_t> fastPathTotalMicros{0};
+    std::atomic<uint64_t> fallbackCalls{0};
+    std::atomic<uint64_t> fallbackTotalMicros{0};
+
+    void reset() {
+        fastPathCalls.store(0);
+        fastPathTotalMicros.store(0);
+        fallbackCalls.store(0);
+        fallbackTotalMicros.store(0);
+    }
+};
+
+ShardKeyExtractionStats gShardKeyStats;
+}  // namespace
+
+BSONObj getShardKeyExtractionStats() {
+    uint64_t fastCalls = gShardKeyStats.fastPathCalls.load();
+    uint64_t fastMicros = gShardKeyStats.fastPathTotalMicros.load();
+    uint64_t fallbackCalls = gShardKeyStats.fallbackCalls.load();
+    uint64_t fallbackMicros = gShardKeyStats.fallbackTotalMicros.load();
+
+    double fastAvg = fastCalls > 0 ? static_cast<double>(fastMicros) / fastCalls : 0;
+    double fallbackAvg = fallbackCalls > 0 ? static_cast<double>(fallbackMicros) / fallbackCalls : 0;
+
+    return BSON("fastPath" << BSON(
+                    "calls" << static_cast<long long>(fastCalls) <<
+                    "totalMicros" << static_cast<long long>(fastMicros) <<
+                    "avgMicros" << fastAvg) <<
+                "fallback" << BSON(
+                    "calls" << static_cast<long long>(fallbackCalls) <<
+                    "totalMicros" << static_cast<long long>(fallbackMicros) <<
+                    "avgMicros" << fallbackAvg));
+}
+
+void resetShardKeyExtractionStats() {
+    gShardKeyStats.reset();
+}
 
 const int ShardKeyPattern::kMaxShardKeySizeBytes = 512;
 const unsigned int ShardKeyPattern::kMaxFlattenedInCombinations = 4000000;
@@ -114,13 +158,25 @@ static vector<FieldRef*> parseShardKeyPattern(const BSONObj& keyPattern) {
     return parsedPaths.release();
 }
 
+bool ShardKeyPattern::computeAllTopLevel(const OwnedPointerVector<FieldRef>& paths) {
+    for (auto it = paths.begin(); it != paths.end(); ++it) {
+        // If any field has more than 1 part (e.g., "a.b"), not all top-level
+        if ((*it)->numParts() != 1) {
+            return false;
+        }
+    }
+    return !paths.empty();
+}
+
 ShardKeyPattern::ShardKeyPattern(const BSONObj& keyPattern)
     : _keyPatternPaths(parseShardKeyPattern(keyPattern)),
-      _keyPattern(_keyPatternPaths.empty() ? BSONObj() : keyPattern) {}
+      _keyPattern(_keyPatternPaths.empty() ? BSONObj() : keyPattern),
+      _allTopLevel(computeAllTopLevel(_keyPatternPaths)) {}
 
 ShardKeyPattern::ShardKeyPattern(const KeyPattern& keyPattern)
     : _keyPatternPaths(parseShardKeyPattern(keyPattern.toBSON())),
-      _keyPattern(_keyPatternPaths.empty() ? KeyPattern(BSONObj()) : keyPattern) {}
+      _keyPattern(_keyPatternPaths.empty() ? KeyPattern(BSONObj()) : keyPattern),
+      _allTopLevel(computeAllTopLevel(_keyPatternPaths)) {}
 
 bool ShardKeyPattern::isValid() const {
     return !_keyPattern.toBSON().isEmpty();
@@ -245,6 +301,41 @@ BSONObj ShardKeyPattern::extractShardKeyFromMatchable(const MatchableDocument& m
 }
 
 BSONObj ShardKeyPattern::extractShardKeyFromDoc(const BSONObj& doc) const {
+    if (!isValid())
+        return BSONObj();
+
+    // Fast path: all shard key fields are top-level (no dotted paths)
+    // This avoids ElementPath construction and MatchableDocument overhead
+    if (_allTopLevel) {
+        // Pre-allocate: typical shard key ~64 bytes (3 fields, 20 chars each + overhead)
+        BSONObjBuilder keyBuilder(64);
+
+        BSONObjIterator patternIt(_keyPattern.toBSON());
+        for (auto it = _keyPatternPaths.begin(); it != _keyPatternPaths.end(); ++it) {
+            BSONElement patternEl = patternIt.next();
+            StringData fieldName = (*it)->dottedField();
+
+            // Zero-copy: doc[fieldName] returns BSONElement pointing into doc's buffer
+            BSONElement matchEl = doc[fieldName];
+
+            if (!isShardKeyElement(matchEl, true))
+                return BSONObj();
+
+            if (isHashedPatternEl(patternEl)) {
+                keyBuilder.append(
+                    patternEl.fieldName(),
+                    BSONElementHasher::hash64(matchEl, BSONElementHasher::DEFAULT_HASH_SEED));
+            } else {
+                // Zero-copy: appendAs copies value but references original data
+                keyBuilder.appendAs(matchEl, patternEl.fieldName());
+            }
+        }
+
+        dassert(isShardKey(keyBuilder.asTempObj()));
+        return keyBuilder.obj();
+    }
+
+    // Fallback: use MatchableDocument for nested paths
     BSONMatchableDocument matchable(doc);
     return extractShardKeyFromMatchable(matchable);
 }
