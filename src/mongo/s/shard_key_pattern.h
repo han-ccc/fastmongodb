@@ -38,6 +38,10 @@
 
 namespace mongo {
 
+// Performance statistics API for shard key extraction
+BSONObj getShardKeyExtractionStats();
+void resetShardKeyExtractionStats();
+
 class CanonicalQuery;
 class FieldRef;
 class OperationContext;
@@ -222,9 +226,19 @@ public:
     BoundList flattenBounds(const IndexBounds& indexBounds) const;
 
 private:
+    /**
+     * Computes whether all shard key fields are top-level (no dotted paths).
+     * Used to enable fast path extraction.
+     */
+    static bool computeAllTopLevel(const OwnedPointerVector<FieldRef>& paths);
+
     // Ordered, parsed paths
     const OwnedPointerVector<FieldRef> _keyPatternPaths;
 
     const KeyPattern _keyPattern;
+
+    // Pre-computed: true if all shard key fields are top-level (numParts == 1)
+    // This enables zero-copy extraction without ElementPath overhead
+    const bool _allTopLevel;
 };
 }
