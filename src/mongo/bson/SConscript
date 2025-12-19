@@ -68,3 +68,23 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/base',
     ],
 )
+
+env.CppUnitTest(
+    target='lazy_bson_test',
+    source=[
+        'lazy_bson_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)
+
+env.Program(
+    target='lazy_bson_benchmark',
+    source=[
+        'lazy_bson_benchmark.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+    ],
+)

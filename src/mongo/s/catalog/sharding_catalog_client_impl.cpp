@@ -81,6 +81,12 @@
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
 
+// ============ SHARDING_OPTIMIZATION_BEGIN ============
+// Config Query Coalescer 集成
+#include "mongo/s/catalog/config_query_coalescer.h"
+#include "mongo/s/catalog/sharding_optimization_parameters.h"
+// ============ SHARDING_OPTIMIZATION_END ============
+
 namespace mongo {
 
 MONGO_FP_DECLARE(failApplyChunkOps);
@@ -97,6 +103,93 @@ using str::stream;
 namespace {
 
 const ReadPreferenceSetting kConfigReadSelector(ReadPreference::Nearest, TagSet{});
+
+// ============ SHARDING_OPTIMIZATION_BEGIN ============
+// Config Query Coalescer 单例
+//
+// 简化实现：直接在 getChunks 中进行内联合并
+// 避免复杂的 QueryExecutor 回调设置
+
+/**
+ * 内联合并组
+ * 用于同一 ns 的并发请求合并
+ */
+struct InlineCoalescingGroup {
+    stdx::mutex mtx;
+    stdx::condition_variable cv;
+    bool queryInProgress{false};
+    bool resultReady{false};
+    int waiters{0};
+    std::vector<BSONObj> sharedResult;
+    Status sharedStatus{Status::OK()};
+};
+
+/**
+ * 内联合并器
+ * 简化的请求合并实现，直接在 getChunks 中使用
+ */
+class InlineChunkCoalescer {
+public:
+    static InlineChunkCoalescer& get() {
+        static InlineChunkCoalescer instance;
+        return instance;
+    }
+
+    bool isEnabled() const {
+        return shardingConfigCoalescerEnabled.load();
+    }
+
+    int getWindowMS() const {
+        return shardingConfigCoalescerWindowMS.load();
+    }
+
+    /**
+     * 获取或创建合并组
+     */
+    InlineCoalescingGroup& getGroup(const std::string& ns) {
+        stdx::lock_guard<stdx::mutex> lock(_groupsMutex);
+        return _groups[ns];
+    }
+
+    void recordQuery() {
+        _totalQueries.fetchAndAdd(1);
+    }
+
+    void recordCoalesced() {
+        _coalescedRequests.fetchAndAdd(1);
+    }
+
+    int getTotalQueries() const { return _totalQueries.load(); }
+    int getCoalescedRequests() const { return _coalescedRequests.load(); }
+
+    double getCoalescingRate() const {
+        int total = _totalQueries.load() + _coalescedRequests.load();
+        return total > 0 ? static_cast<double>(_coalescedRequests.load()) / total : 0.0;
+    }
+
+private:
+    InlineChunkCoalescer() {}
+
+    stdx::mutex _groupsMutex;
+    std::map<std::string, InlineCoalescingGroup> _groups;
+    AtomicInt32 _totalQueries{0};
+    AtomicInt32 _coalescedRequests{0};
+};
+
+/**
+ * 从查询 BSONObj 中提取 ns 字段
+ * 支持格式: {ns: "db.coll"} 或 {ns: "db.coll", ...}
+ */
+boost::optional<std::string> extractNsFromQuery(const BSONObj& query) {
+    BSONElement nsElem = query["ns"];
+    if (nsElem.type() == String) {
+        return nsElem.String();
+    }
+    return boost::none;
+}
+
+// ============ SHARDING_OPTIMIZATION_END ============
+
 const ReadPreferenceSetting kConfigPrimaryPreferredSelector(ReadPreference::PrimaryPreferred,
                                                             TagSet{});
 const int kMaxReadRetry = 3;
@@ -1078,7 +1171,116 @@ Status ShardingCatalogClientImpl::getChunks(OperationContext* txn,
               readConcern == repl::ReadConcernLevel::kMajorityReadConcern);
     chunks->clear();
 
-    // Convert boost::optional<int> to boost::optional<long long>.
+    // ============ SHARDING_OPTIMIZATION_BEGIN ============
+    // 内联请求合并
+    // 当多个 mongos 同时查询同一 ns 时，只执行一次查询
+    auto& coalescer = InlineChunkCoalescer::get();
+
+    if (coalescer.isEnabled()) {
+        auto nsOpt = extractNsFromQuery(query);
+        if (nsOpt) {
+            auto& group = coalescer.getGroup(*nsOpt);
+            std::unique_lock<stdx::mutex> lock(group.mtx);
+
+            if (group.queryInProgress) {
+                // 已有查询进行中，等待结果
+                group.waiters++;
+                coalescer.recordCoalesced();
+
+                // 等待结果就绪
+                bool waitSuccess = group.cv.wait_for(
+                    lock,
+                    stdx::chrono::milliseconds(shardingConfigCoalescerMaxWaitMS.load()),
+                    [&group] { return group.resultReady; });
+
+                group.waiters--;
+
+                if (waitSuccess && group.sharedStatus.isOK()) {
+                    // 复用共享结果
+                    for (const BSONObj& obj : group.sharedResult) {
+                        auto chunkRes = ChunkType::fromBSON(obj);
+                        if (chunkRes.isOK()) {
+                            chunks->push_back(chunkRes.getValue());
+                        }
+                    }
+
+                    // 最后一个等待者清理结果
+                    if (group.waiters == 0) {
+                        group.resultReady = false;
+                        group.sharedResult.clear();
+                    }
+
+                    LOG(2) << "Coalesced query for " << *nsOpt << ", " << chunks->size() << " chunks";
+                    return Status::OK();
+                }
+
+                // 超时或错误，回退到独立查询
+                if (group.waiters == 0) {
+                    group.resultReady = false;
+                    group.sharedResult.clear();
+                }
+                // 继续执行独立查询
+            } else {
+                // 成为 leader，等待合并窗口
+                group.queryInProgress = true;
+                lock.unlock();
+
+                // 等待合并窗口，让更多请求加入
+                stdx::this_thread::sleep_for(
+                    stdx::chrono::milliseconds(coalescer.getWindowMS()));
+
+                coalescer.recordQuery();
+
+                // 执行实际查询
+                auto longLimit = limit ? boost::optional<long long>(*limit) : boost::none;
+                auto findStatus = _exhaustiveFindOnConfig(txn,
+                                                          kConfigReadSelector,
+                                                          readConcern,
+                                                          NamespaceString(ChunkType::ConfigNS),
+                                                          query,
+                                                          sort,
+                                                          longLimit);
+
+                lock.lock();
+
+                if (findStatus.isOK()) {
+                    // 存储结果供其他等待者使用
+                    group.sharedResult = findStatus.getValue().value;
+                    group.sharedStatus = Status::OK();
+
+                    for (const BSONObj& obj : group.sharedResult) {
+                        auto chunkRes = ChunkType::fromBSON(obj);
+                        if (chunkRes.isOK()) {
+                            chunks->push_back(chunkRes.getValue());
+                        }
+                    }
+
+                    if (opTime) {
+                        *opTime = findStatus.getValue().opTime;
+                    }
+                } else {
+                    group.sharedStatus = findStatus.getStatus();
+                }
+
+                group.queryInProgress = false;
+                group.resultReady = true;
+                group.cv.notify_all();
+
+                LOG(2) << "Leader query for " << *nsOpt << ", " << chunks->size()
+                       << " chunks, " << group.waiters << " waiters";
+
+                if (findStatus.isOK()) {
+                    return Status::OK();
+                }
+                return {findStatus.getStatus().code(),
+                        str::stream() << "Failed to load chunks due to "
+                                      << findStatus.getStatus().reason()};
+            }
+        }
+    }
+    // ============ SHARDING_OPTIMIZATION_END ============
+
+    // 原始查询路径（合并未启用或非 ns 查询）
     auto longLimit = limit ? boost::optional<long long>(*limit) : boost::none;
     auto findStatus = _exhaustiveFindOnConfig(txn,
                                               kConfigReadSelector,
