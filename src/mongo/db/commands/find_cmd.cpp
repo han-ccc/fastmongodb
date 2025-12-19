@@ -350,6 +350,7 @@ public:
         BSONObj obj;
         PlanExecutor::ExecState state = PlanExecutor::ADVANCED;
         long long numResults = 0;
+
         while (!FindCommon::enoughForFirstBatch(originalQR, numResults) &&
                PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
             // If we can't fit this result inside the current batch, then we stash it for later.
@@ -369,11 +370,11 @@ public:
             error() << "Plan executor error during find command: " << PlanExecutor::statestr(state)
                     << ", stats: " << redact(Explain::getWinningPlanStats(exec.get()));
 
-            return appendCommandStatus(result,
-                                       Status(ErrorCodes::OperationFailed,
-                                              str::stream()
-                                                  << "Executor error during find command: "
-                                                  << WorkingSetCommon::toStatusString(obj)));
+            Status errorStatus(ErrorCodes::OperationFailed,
+                               str::stream() << "Executor error during find command: "
+                                             << WorkingSetCommon::toStatusString(obj));
+
+            return appendCommandStatus(result, errorStatus);
         }
 
         // Before saving the cursor, ensure that whatever plan we established happened with the
@@ -419,6 +420,7 @@ public:
 
         // Generate the response object to send to the client.
         firstBatch.done(cursorId, nss.ns());
+
         return true;
     }
 
