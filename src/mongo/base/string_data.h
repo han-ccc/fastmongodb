@@ -30,6 +30,7 @@
 #pragma once
 
 #include <algorithm>  // for min
+#include <cstdint>    // for uint64_t
 #include <cstring>
 #include <iosfwd>
 #include <limits>
@@ -195,7 +196,21 @@ private:
 };
 
 inline bool operator==(StringData lhs, StringData rhs) {
-    return (lhs.size() == rhs.size()) && (lhs.compare(rhs) == 0);
+    size_t sz = lhs.size();
+    if (sz != rhs.size())
+        return false;
+
+    // 短字符串优化: 使用整数比较替代memcmp
+    // 对于≤8字节的字符串，单次64位比较比memcmp更快
+    if (sz <= 8) {
+        uint64_t a = 0, b = 0;
+        // 使用memcpy确保对齐安全，编译器会优化为直接加载
+        std::memcpy(&a, lhs.rawData(), sz);
+        std::memcpy(&b, rhs.rawData(), sz);
+        return a == b;
+    }
+
+    return lhs.compare(rhs) == 0;
 }
 
 inline bool operator!=(StringData lhs, StringData rhs) {

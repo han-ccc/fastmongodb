@@ -49,6 +49,10 @@
 namespace mongo {
 namespace str = mongoutils::str;
 
+// C++11 requires out-of-class definition for ODR-used static constexpr members
+constexpr uint8_t BSONElement::kFixedSizes[];
+constexpr uint32_t BSONElement::kVariableSizeMask;
+
 using std::dec;
 using std::hex;
 using std::string;
@@ -575,61 +579,40 @@ int BSONElement::size() const {
     if (totalSize >= 0)
         return totalSize;
 
-    int x = 0;
-    switch (type()) {
-        case EOO:
-        case Undefined:
-        case jstNULL:
-        case MaxKey:
-        case MinKey:
-            break;
-        case mongo::Bool:
-            x = 1;
-            break;
-        case NumberInt:
-            x = 4;
-            break;
-        case bsonTimestamp:
-        case mongo::Date:
-        case NumberDouble:
-        case NumberLong:
-            x = 8;
-            break;
-        case NumberDecimal:
-            x = 16;
-            break;
-        case jstOID:
-            x = OID::kOIDSize;
-            break;
-        case Symbol:
-        case Code:
-        case mongo::String:
+    int t = static_cast<int>(type());
+    int x;
+
+    // 快速路径: 固定大小类型使用查表 (O(1))
+    // kFixedSizes[t] > 0 表示固定大小, 0 表示需要特殊处理
+    if (t < 32 && kFixedSizes[t] != 0) {
+        x = kFixedSizes[t];
+    } else {
+        // 变长类型使用位掩码分组判断
+        // String/Code/Symbol: 4字节长度 + 字符串内容
+        constexpr uint32_t kStringSizeMask =
+            (1u << mongo::String) | (1u << Code) | (1u << Symbol);
+        // Object/Array/CodeWScope: objsize()直接给出完整大小
+        constexpr uint32_t kObjectSizeMask =
+            (1u << Object) | (1u << mongo::Array) | (1u << CodeWScope);
+
+        uint32_t typeBit = 1u << t;
+        if (typeBit & kStringSizeMask) {
             x = valuestrsize() + 4;
-            break;
-        case DBRef:
-            x = valuestrsize() + 4 + 12;
-            break;
-        case CodeWScope:
-        case Object:
-        case mongo::Array:
+        } else if (typeBit & kObjectSizeMask) {
             x = objsize();
-            break;
-        case BinData:
+        } else if (t == BinData) {
             x = valuestrsize() + 4 + 1 /*subtype*/;
-            break;
-        case RegEx: {
+        } else if (t == DBRef) {
+            x = valuestrsize() + 4 + 12;
+        } else if (t == RegEx) {
             const char* p = value();
             size_t len1 = strlen(p);
             p = p + len1 + 1;
-            size_t len2;
-            len2 = strlen(p);
+            size_t len2 = strlen(p);
             x = (int)(len1 + 1 + len2 + 1);
-        } break;
-        default: {
-            StringBuilder ss;
-            ss << "BSONElement: bad type " << (int)type();
-            std::string msg = ss.str();
-            massert(10320, msg.c_str(), false);
+        } else {
+            // EOO, Undefined, Null, MaxKey, MinKey: 无值部分
+            x = 0;
         }
     }
     totalSize = x + fieldNameSize() + 1;  // BSONType
