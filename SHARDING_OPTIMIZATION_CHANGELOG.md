@@ -233,6 +233,75 @@ python3 /tmp/real_config_benchmark.py scale  # 多 collection 测试
 
 ---
 
+### 2024-12-23: ConfigQueryCoalescer 完整实现与测试验证
+
+**背景**: 之前的 Config Server 侧 Coalescer 集成完成基本框架，但缺少版本差距区分合并逻辑和完整的单元测试。本次补全了所有待完成项。
+
+**新增功能**:
+1. **版本差距区分合并** - 当请求的版本差距过大时，独立执行查询而不合并
+   - 新增服务端参数 `configQueryCoalescerMaxVersionGap` (默认 500)
+   - 版本从查询过滤器 `{lastmod: {$gt: Timestamp(...)}}` 中提取
+   - 统计 `versionGapSkippedRequests` 记录因版本差距跳过合并的请求数
+
+2. **完整版本提取** - 从 find 命令的 filter 中提取真实版本号
+   - 解析 `cmdObj.filter.lastmod.$gt` 获取 Timestamp
+   - 使用 `Timestamp::asULL()` 转换为 uint64_t 版本号
+
+**修改的文件**:
+1. `src/mongo/db/s/config/config_query_coalescer.h`
+   - `tryCoalesce()` 新增 `requestVersion` 参数
+   - `Waiter` 结构新增 `requestedVersion` 字段
+   - `CoalescingGroup` 新增 `minVersion`, `maxVersion` 字段
+   - `Stats` 新增 `versionGapSkippedRequests` 统计
+
+2. `src/mongo/db/s/config/config_query_coalescer.cpp`
+   - 新增服务端参数 `configQueryCoalescerMaxVersionGap`
+   - 版本差距检查逻辑: `if (newMaxVersion - newMinVersion > maxVersionGap)`
+   - 版本范围更新: `group->minVersion = std::min(...)`, `group->maxVersion = std::max(...)`
+
+3. `src/mongo/db/commands/find_cmd.cpp`
+   - 从 filter 提取版本号的完整逻辑
+   - 更新 `tryCoalesce()` 调用传递版本参数
+
+4. `src/mongo/db/s/config/config_query_coalescer_test.cpp` (新增)
+   - 8 个单元测试用例覆盖核心功能
+   - BasicCoalescing: 验证基本合并功能
+   - VersionGapSkipped: 验证版本差距过大独立执行
+   - DifferentNamespacesNotCoalesced: 验证不同 namespace 不合并
+   - QueryErrorPropagation: 验证错误传播
+   - StatsAccuracy: 验证统计准确性
+   - ShutdownHandling: 验证关闭处理
+   - ResultsDistributedToAllWaiters: 验证结果分发
+   - CoalescingRateCalculation: 验证合并率计算
+
+5. `src/mongo/db/s/SConscript`
+   - 新增 `config_query_coalescer_test` 单元测试配置
+
+6. `src/mongo/s/catalog/coalescer_e2e_stress_test.cpp` (修复)
+   - 改用外部 mongod (端口 27019) 而非自启动
+   - 添加 `version_impl` 依赖解决 VersionInfoInterface 初始化问题
+   - 减少线程数 (1000→100) 和测试时间 (30s→10s) 降低系统压力
+
+**测试结果**:
+```
+单元测试 (8 tests):
+  ConfigQueryCoalescerTest | tests: 8 | fails: 0 | time: 0.136s
+  SUCCESS - All tests passed
+
+E2E 压力测试 (100 线程, 50000 chunks):
+  Total queries:   46138
+  Success:         46138
+  Failed:          0
+  Success rate:    100.00%
+  Avg latency:     1359 us
+  Max latency:     8575 us
+  Overall QPS:     4593
+```
+
+**核心价值**: ConfigQueryCoalescer 现在完整支持版本差距区分，可以智能地决定是否合并请求，避免版本差距过大时导致的无效合并。
+
+---
+
 ## 待评估/未来方向
 
 1. ~~**Config Server 侧请求合并**~~ - 已实现并端到端验证 (find_cmd.cpp)
@@ -253,11 +322,7 @@ src/mongo/s/catalog/
 ├── batch_query.cpp               # 批量查询实现
 ├── batch_query.h
 ├── batch_query_test.cpp
-├── config_query_coalescer.cpp    # Config Server 请求合并 (新增)
-├── config_query_coalescer.h
-├── config_query_coalescer_test.cpp
-├── config_query_coalescer_benchmark.cpp
-├── config_query_coalescer_standalone_test.cpp  # 独立验证程序
+├── coalescer_e2e_stress_test.cpp # E2E 压力测试 (已修复)
 ├── sharding_routing_optimizer.cpp # 整合层
 ├── sharding_routing_optimizer.h
 ├── sharding_optimization_parameters.cpp # 参数
@@ -266,4 +331,12 @@ src/mongo/s/catalog/
 ├── sharding_optimization_stats.h
 ├── integration_stress_test.cpp   # 压力测试
 └── SHARDING_OPTIMIZATION_PATCH.md # 补丁说明
+
+src/mongo/db/s/config/
+├── config_query_coalescer.cpp    # Config Server 请求合并 (核心实现)
+├── config_query_coalescer.h
+└── config_query_coalescer_test.cpp # 单元测试 (8 tests)
+
+src/mongo/db/commands/
+└── find_cmd.cpp                  # Config Server 侧 Coalescer 集成点
 ```
