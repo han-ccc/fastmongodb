@@ -119,6 +119,27 @@ env.CppUnitTest(
 )
 
 env.Library(
+    target='config_query_coalescer',
+    source=[
+        'config/config_query_coalescer.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        '$BUILD_DIR/mongo/db/server_parameters',
+    ],
+)
+
+env.CppUnitTest(
+    target='config_query_coalescer_test',
+    source=[
+        'config/config_query_coalescer_test.cpp',
+    ],
+    LIBDEPS=[
+        'config_query_coalescer',
+    ],
+)
+
+env.Library(
     target='commands',
     source=[
         'check_sharding_index_command.cpp',

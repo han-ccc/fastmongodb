@@ -201,3 +201,16 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_test_fixture',
     ]
 )
+
+# Coalescer E2E stress test - high concurrency query test
+env.CppUnitTest(
+    target='coalescer_e2e_stress_test',
+    source=[
+        'coalescer_e2e_stress_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/client/clientdriver',
+        '$BUILD_DIR/mongo/unittest/unittest',
+        '$BUILD_DIR/mongo/util/version_impl',
+    ]
+)

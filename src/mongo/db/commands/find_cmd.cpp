@@ -49,6 +49,7 @@
 #include "mongo/db/query/get_executor.h"
 #include "mongo/db/repl/replication_coordinator.h"
 #include "mongo/db/s/collection_sharding_state.h"
+#include "mongo/db/s/config/config_query_coalescer.h"
 #include "mongo/db/server_options.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/service_context.h"
@@ -241,6 +242,75 @@ public:
             return appendCommandStatus(
                 result,
                 Status(ErrorCodes::IllegalOperation, "Cannot run find command from eval()"));
+        }
+
+        // Config Server Query Coalescing for config.chunks
+        // When enabled, coalesce concurrent queries from multiple mongos instances
+        if (serverGlobalParams.clusterRole == ClusterRole::ConfigServer &&
+            nss.ns() == "config.chunks" &&
+            ConfigQueryCoalescer::isEnabled()) {
+
+            // Extract version from filter: {lastmod: {$gt: Timestamp(...)}}
+            uint64_t requestVersion = 0;
+            BSONObj filter = cmdObj.getObjectField("filter");
+            if (!filter.isEmpty()) {
+                BSONElement lastmodEl = filter["lastmod"];
+                if (lastmodEl.type() == Object) {
+                    BSONObj lastmodObj = lastmodEl.Obj();
+                    BSONElement gtEl = lastmodObj["$gt"];
+                    if (gtEl.type() == bsonTimestamp) {
+                        requestVersion = gtEl.timestamp().asULL();
+                    }
+                }
+            }
+
+            auto queryFunc = [&]() -> StatusWith<std::vector<BSONObj>> {
+                // Execute the actual find query
+                std::vector<BSONObj> results;
+
+                AutoGetCollectionForRead ctx(txn, nss);
+                Collection* collection = ctx.getCollection();
+                if (!collection) {
+                    return results;  // Empty result for non-existent collection
+                }
+
+                auto qrStatus = QueryRequest::makeFromFindCommand(nss, cmdObj, false);
+                if (!qrStatus.isOK()) {
+                    return qrStatus.getStatus();
+                }
+                auto statusWithCQ = CanonicalQuery::canonicalize(
+                    txn,
+                    std::move(qrStatus.getValue()),
+                    ExtensionsCallbackReal(txn, &nss));
+                if (!statusWithCQ.isOK()) {
+                    return statusWithCQ.getStatus();
+                }
+
+                auto statusWithPE = getExecutorFind(
+                    txn, collection, nss, std::move(statusWithCQ.getValue()), PlanExecutor::YIELD_AUTO);
+                if (!statusWithPE.isOK()) {
+                    return statusWithPE.getStatus();
+                }
+
+                auto exec = std::move(statusWithPE.getValue());
+                BSONObj obj;
+                while (exec->getNext(&obj, NULL) == PlanExecutor::ADVANCED) {
+                    results.push_back(obj.getOwned());
+                }
+                return results;
+            };
+
+            auto coalescedResult = ConfigQueryCoalescer::get().tryCoalesce(txn, nss.ns(), requestVersion, queryFunc);
+            if (coalescedResult.isOK()) {
+                // Return coalesced results
+                CursorResponseBuilder firstBatch(true, &result);
+                for (const auto& obj : coalescedResult.getValue()) {
+                    firstBatch.append(obj);
+                }
+                firstBatch.done(0, nss.ns());
+                return true;
+            }
+            // Fall through to original logic on error
         }
 
         // Parse the command BSON to a QueryRequest.
