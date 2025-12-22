@@ -49,6 +49,26 @@ namespace {
 // Configuration
 // ============================================================================
 
+// Version scenario for testing coalescer behavior
+enum class VersionScenario {
+    RANDOM,         // Uniform random [1, numChunks] - baseline
+    SAME_VERSION,   // All requests use same version - max coalescing
+    CLOSE_VERSIONS, // Versions within [base, base+100] - high coalescing
+    BOUNDARY_GAP,   // Versions within [base, base+500] - boundary test
+    HOTSPOT_MIX     // 80% close versions, 20% random - realistic
+};
+
+const char* versionScenarioName(VersionScenario s) {
+    switch (s) {
+        case VersionScenario::RANDOM: return "RANDOM";
+        case VersionScenario::SAME_VERSION: return "SAME_VERSION";
+        case VersionScenario::CLOSE_VERSIONS: return "CLOSE_VERSIONS";
+        case VersionScenario::BOUNDARY_GAP: return "BOUNDARY_GAP";
+        case VersionScenario::HOTSPOT_MIX: return "HOTSPOT_MIX";
+    }
+    return "UNKNOWN";
+}
+
 struct TestConfig {
     int port = 27019;
 
@@ -60,6 +80,9 @@ struct TestConfig {
     // Test parameters
     size_t testDurationSec = 30;
     double maxFailRate = 0.01;  // 1% fail rate = limit reached
+
+    // Version scenario
+    VersionScenario versionScenario = VersionScenario::RANDOM;
 };
 
 // Collection configuration
@@ -241,13 +264,17 @@ struct TestStats {
         tinyCollQueries = 0;
     }
 
-    void recordSuccess(uint64_t latencyUs) {
+    void recordSuccess(int64_t latencyUs) {
+        // Guard against negative latency (clock issues)
+        if (latencyUs < 0) latencyUs = 0;
+
         totalQueries++;
         successQueries++;
-        totalLatencyUs += latencyUs;
+        totalLatencyUs += static_cast<uint64_t>(latencyUs);
 
+        uint64_t latency = static_cast<uint64_t>(latencyUs);
         uint64_t current = maxLatencyUs.load();
-        while (latencyUs > current && !maxLatencyUs.compare_exchange_weak(current, latencyUs)) {}
+        while (latency > current && !maxLatencyUs.compare_exchange_weak(current, latency)) {}
     }
 
     void recordFailure() {
@@ -272,7 +299,8 @@ struct TestStats {
 
 class CollectionSelector {
 public:
-    CollectionSelector() : _gen(_rd()) {}
+    CollectionSelector(VersionScenario scenario = VersionScenario::RANDOM)
+        : _gen(_rd()), _scenario(scenario) {}
 
     struct Selection {
         std::string ns;
@@ -303,13 +331,42 @@ public:
         }
     }
 
+    // Get version based on scenario
     size_t getVersion(size_t maxVersion) {
-        return 1 + (_gen() % maxVersion);
+        size_t baseVersion = maxVersion / 2;  // Middle of range
+
+        switch (_scenario) {
+            case VersionScenario::SAME_VERSION:
+                // All requests use same version - maximum coalescing potential
+                return baseVersion;
+
+            case VersionScenario::CLOSE_VERSIONS:
+                // Versions within [base, base+100] - gap < maxVersionGap(500)
+                return baseVersion + (_gen() % 100);
+
+            case VersionScenario::BOUNDARY_GAP:
+                // Versions within [base, base+500] - at boundary of maxVersionGap
+                return baseVersion + (_gen() % 500);
+
+            case VersionScenario::HOTSPOT_MIX:
+                // 80% close versions, 20% random - realistic scenario
+                if ((_gen() % 100) < 80) {
+                    return baseVersion + (_gen() % 100);
+                } else {
+                    return 1 + (_gen() % maxVersion);
+                }
+
+            case VersionScenario::RANDOM:
+            default:
+                // Uniform random - baseline, many will skip coalescing
+                return 1 + (_gen() % maxVersion);
+        }
     }
 
 private:
     std::random_device _rd;
     std::mt19937 _gen;
+    VersionScenario _scenario;
 };
 
 // ============================================================================
@@ -407,12 +464,12 @@ private:
 
 class QueryWorker {
 public:
-    QueryWorker(int port, TestStats& stats, std::atomic<bool>& running)
-        : _port(port), _stats(stats), _running(running) {}
+    QueryWorker(int port, TestStats& stats, std::atomic<bool>& running, VersionScenario scenario)
+        : _port(port), _stats(stats), _running(running), _scenario(scenario) {}
 
     void run() {
         HostAndPort server("localhost", _port);
-        CollectionSelector selector;
+        CollectionSelector selector(_scenario);
 
         try {
             DBClientConnection conn;
@@ -459,6 +516,7 @@ private:
     int _port;
     TestStats& _stats;
     std::atomic<bool>& _running;
+    VersionScenario _scenario;
 };
 
 // ============================================================================
@@ -467,11 +525,12 @@ private:
 
 class ResultPrinter {
 public:
-    static void printHeader(size_t concurrency, size_t durationSec) {
+    static void printHeader(size_t concurrency, size_t durationSec, VersionScenario scenario) {
         std::cout << "\n";
         printLine();
         std::cout << "  Coalescer E2E Stress Test - " << concurrency << " threads" << std::endl;
         std::cout << "  Duration: " << durationSec << "s | Collections: 104 | Chunks: 100,000" << std::endl;
+        std::cout << "  Version Scenario: " << versionScenarioName(scenario) << std::endl;
         printLine();
     }
 
@@ -569,7 +628,7 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
     stats.reset();
     ResourceStats resources;
 
-    ResultPrinter::printHeader(numThreads, config.testDurationSec);
+    ResultPrinter::printHeader(numThreads, config.testDurationSec, config.versionScenario);
 
     // Start resource monitor
     ResourceMonitor monitor(resources, mongodPid);
@@ -584,7 +643,7 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
 
     for (size_t i = 0; i < numThreads; i++) {
         workers.emplace_back([&config, &stats, &running]() {
-            QueryWorker worker(config.port, stats, running);
+            QueryWorker worker(config.port, stats, running, config.versionScenario);
             worker.run();
         });
     }
@@ -693,6 +752,78 @@ TEST(CoalescerE2EStressTest, ConcurrencyExploration) {
     std::cout << "\n  [PASS] Concurrency exploration completed!" << std::endl;
     std::cout << "  Maximum stable concurrency: " << results.back().first << " threads" << std::endl;
     std::cout << "  Peak QPS: " << results.back().second << std::endl;
+}
+
+// ============================================================================
+// Version Scenario Test - Compare different version distributions
+// ============================================================================
+
+TEST(CoalescerE2EStressTest, VersionScenarioComparison) {
+    TestConfig config;
+    config.startConcurrency = 1000;
+    config.maxConcurrency = 1000;  // Single concurrency level
+    config.testDurationSec = 15;   // Shorter duration per scenario
+
+    TestStats stats;
+
+    std::cout << "\n";
+    std::cout << "  ============================================================" << std::endl;
+    std::cout << "    Version Scenario Comparison Test" << std::endl;
+    std::cout << "    Concurrency: " << config.startConcurrency << " threads" << std::endl;
+    std::cout << "    Duration: " << config.testDurationSec << "s per scenario" << std::endl;
+    std::cout << "  ============================================================" << std::endl;
+
+    // Insert test data once
+    if (!DataGenerator::insertAllCollections(config.port)) {
+        FAIL("Failed to insert test data. Is mongod running?");
+        return;
+    }
+
+    int mongodPid = getMongodPid(config.port);
+    if (mongodPid <= 0) {
+        mongodPid = 1;
+    }
+
+    // Test each scenario
+    std::vector<VersionScenario> scenarios = {
+        VersionScenario::SAME_VERSION,
+        VersionScenario::CLOSE_VERSIONS,
+        VersionScenario::BOUNDARY_GAP,
+        VersionScenario::HOTSPOT_MIX,
+        VersionScenario::RANDOM
+    };
+
+    std::vector<std::tuple<const char*, uint64_t, uint64_t>> scenarioResults;
+
+    for (auto scenario : scenarios) {
+        config.versionScenario = scenario;
+
+        std::cout << "\n  >>> Testing scenario: " << versionScenarioName(scenario) << std::endl;
+
+        auto result = runTestRound(config, config.startConcurrency, stats, mongodPid);
+        scenarioResults.push_back({versionScenarioName(scenario), result.qps, result.avgLatencyUs});
+
+        // Pause between scenarios
+        std::cout << "  [Pause 3 seconds before next scenario...]" << std::endl;
+        std::this_thread::sleep_for(std::chrono::seconds(3));
+    }
+
+    // Print comparison summary
+    std::cout << "\n";
+    std::cout << "  ========================================================" << std::endl;
+    std::cout << "    VERSION SCENARIO COMPARISON RESULTS" << std::endl;
+    std::cout << "  ========================================================" << std::endl;
+    std::cout << "  Scenario            QPS       Avg Latency" << std::endl;
+    std::cout << "  ----------------  -------  -------------" << std::endl;
+
+    for (const auto& r : scenarioResults) {
+        std::cout << "  " << std::left << std::setw(16) << std::get<0>(r)
+                  << "  " << std::right << std::setw(7) << std::get<1>(r)
+                  << "  " << std::setw(10) << std::get<2>(r) << " us" << std::endl;
+    }
+    std::cout << "  ========================================================" << std::endl;
+
+    std::cout << "\n  [PASS] Version scenario comparison completed!" << std::endl;
 }
 
 }  // namespace
