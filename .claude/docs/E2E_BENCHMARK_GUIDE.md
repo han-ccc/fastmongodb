@@ -138,14 +138,20 @@ def f_scheme_reset(sock, db):
 
 ### 主测试脚本
 
-位置: `/tmp/stability_benchmark_v6.py`
+位置: `buildscripts/benchmarks/stability_benchmark_v7.py`
 
 ```bash
-# 运行单次测试
-python3 /tmp/stability_benchmark_v6.py
+# 运行单次测试 (分片集群 27020)
+python3 buildscripts/benchmarks/stability_benchmark_v7.py
+
+# 单节点模式 (27019)
+python3 buildscripts/benchmarks/stability_benchmark_v7.py --port 27019
+
+# 快速测试
+python3 buildscripts/benchmarks/stability_benchmark_v7.py --iterations 100 --warmup 20
 
 # 结果保存到
-# → /tmp/stability_v6_result.json
+# → /tmp/stability_v7_result.json
 ```
 
 ### 脚本核心结构
@@ -337,8 +343,8 @@ scons mongod mongos --disable-warnings-as-errors -j24
 ./start_cluster.sh
 
 # 4. 运行 F 方案测试 (至少2轮)
-python3 /tmp/stability_benchmark_v6.py  # Run 1
-python3 /tmp/stability_benchmark_v6.py  # Run 2
+python3 buildscripts/benchmarks/stability_benchmark_v7.py  # Run 1
+python3 buildscripts/benchmarks/stability_benchmark_v7.py  # Run 2
 
 # 5. 合并基线
 python3 /tmp/merge_baseline.py \

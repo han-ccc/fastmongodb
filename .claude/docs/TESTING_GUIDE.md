@@ -58,7 +58,7 @@ python buildscripts/clang_format.py format  # 自动修复
 python /tmp/crud_benchmark_v3.py
 
 # 运行F方案端到端测试 (分片集群)
-python3 /tmp/stability_benchmark_v6.py
+python3 buildscripts/benchmarks/stability_benchmark_v7.py
 
 # 性能基线
 # 复杂表 INSERT(批量10): ~1470us (v1.0.0)
@@ -153,6 +153,18 @@ int main() {
 |-----|------|
 | `/tmp/*_benchmark.cpp` | 临时微基准测试 |
 | `src/mongo/*/xxx_benchmark.cpp` | 持久化微基准 (可选) |
+
+### 基准脚本管理规范
+
+**规则**: 基准测试脚本可以在 `/tmp` 目录开发调试，**稳定后必须提交到代码仓库**。
+
+| 阶段 | 位置 | 说明 |
+|------|------|------|
+| 开发调试 | `/tmp/*.py` | 快速迭代，无需提交 |
+| 稳定版本 | `buildscripts/benchmarks/*.py` | 纳入版本控制，可复现 |
+
+当前稳定脚本:
+- `buildscripts/benchmarks/stability_benchmark_v7.py` - 27用例端到端测试
 
 ### 结果呈现格式
 

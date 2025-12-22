@@ -9,7 +9,9 @@
 ### 主文档
 - 性能日志: `PERFORMANCE_OPTIMIZATION_LOG.md`
 - 优化方案: `FIELD_EXTRACTION_OPTIMIZATION.md`
-- 基准测试脚本: `/tmp/crud_benchmark_v3.py`
+- 基准测试脚本:
+  - 单节点: `/tmp/crud_benchmark_v3.py`
+  - 端到端(27用例): `buildscripts/benchmarks/stability_benchmark_v7.py`
 
 ### 分层Timing统计系统 (v2.1.0)
 
@@ -135,3 +137,4 @@ A: 在3字段分片键场景下，性能差异在噪声范围内(±5%)。原因�
 | 2025-12-20 | BatchFieldExtractor 集成到 ShardKeyPattern::extractShardKeyFromDoc()，等待分片场景测试 |
 | 2025-12-20 | **分片场景严格对比测试**: INSERT -2.5%，UPDATE -3.0%，QUERY无影响(已验证代码路径独立) |
 | 2025-12-20 | **v2.1.0 分层Timing系统**: 新增mongos/mongod/RocksDB分层时延统计，搭建分片集群测试环境 |
+| 2025-12-23 | **stability_benchmark_v7.py**: 重新生成27用例端到端基准测试脚本，原始Wire Protocol实现 |
