@@ -85,8 +85,10 @@ public:
      */
     struct Config {
         Milliseconds coalescingWindow{Milliseconds(5)};
-        Milliseconds maxWaitTime{Milliseconds(100)};
+        Milliseconds maxWaitTime{Milliseconds(100)};      // 单次等待超时，超时后尝试升级为 leader
+        Milliseconds maxTotalWaitTime{Milliseconds(15000)}; // 总超时时间，超过才真正失败
         size_t maxWaitersPerGroup{1000};
+        uint64_t maxVersionGap{500};
 
         Config() = default;
     };
@@ -136,16 +138,22 @@ public:
 
 private:
     /**
-     * 等待者信息
+     * 共享结果类型 - 避免在持锁状态下复制大量数据
+     */
+    using SharedResult = std::shared_ptr<std::vector<BSONObj>>;
+
+    /**
+     * 等待者信息 - 所有指针都指向调用者栈上的变量
+     * 这样可以在删除 group 后仍然安全地访问这些指针
      */
     struct Waiter {
-        std::vector<BSONObj>* resultPtr;
-        Status* statusPtr;
-        uint64_t requestedVersion{0};  // 请求的版本号
-        bool done{false};
+        SharedResult* sharedResultPtr;   // 指向调用者的 shared_ptr
+        Status* statusPtr;               // 指向调用者的 Status
+        std::atomic<bool>* donePtr;      // 指向调用者的 atomic<bool>
+        uint64_t requestedVersion{0};    // 请求的版本号
 
-        Waiter(std::vector<BSONObj>* res, Status* stat, uint64_t version)
-            : resultPtr(res), statusPtr(stat), requestedVersion(version) {}
+        Waiter(SharedResult* res, Status* stat, std::atomic<bool>* done, uint64_t version)
+            : sharedResultPtr(res), statusPtr(stat), donePtr(done), requestedVersion(version) {}
     };
 
     /**
@@ -158,7 +166,7 @@ private:
         uint64_t maxVersion{0};           // 组内最大版本
         bool queryInProgress{false};
         bool queryCompleted{false};
-        std::vector<BSONObj> queryResult;
+        SharedResult queryResult;         // 使用 shared_ptr，分发时只复制指针
         Status queryStatus{Status::OK()};
         std::list<Waiter> waiters;
 

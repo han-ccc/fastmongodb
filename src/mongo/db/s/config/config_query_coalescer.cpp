@@ -93,26 +93,28 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
         _stats.totalRequests++;
     }
 
-    std::vector<BSONObj> result;
+    // 所有数据都在调用者栈上，可以在锁外安全访问
+    SharedResult sharedResult;
     Status status = Status::OK();
+    std::atomic<bool> done{false};
 
-    // Get config from server parameters
-    Milliseconds windowDuration(configQueryCoalescerWindowMS.load());
-    Milliseconds maxWait(configQueryCoalescerMaxWaitMS.load());
-    size_t maxWaiters = static_cast<size_t>(configQueryCoalescerMaxWaiters.load());
-    uint64_t maxVersionGap = static_cast<uint64_t>(configQueryCoalescerMaxVersionGap.load());
+    // Use instance config
+    Milliseconds windowDuration = _config.coalescingWindow;
+    Milliseconds maxWait = _config.maxWaitTime;
+    size_t maxWaiters = _config.maxWaitersPerGroup;
+    uint64_t maxVersionGap = _config.maxVersionGap;
 
     stdx::unique_lock<stdx::mutex> lock(_mutex);
 
     auto it = _groups.find(ns);
 
-    // Case 1: No existing group, create new one and become leader
+    // Case 1: No existing group → 创建 group，立即执行查询（无窗口等待）
     if (it == _groups.end()) {
         auto group = stdx::make_unique<CoalescingGroup>(ns);
-        group->windowEnd = Date_t::now() + windowDuration;
         group->minVersion = requestVersion;
         group->maxVersion = requestVersion;
-        group->waiters.emplace_back(&result, &status, requestVersion);
+        group->queryInProgress = true;  // 立即标记为执行中
+        group->waiters.emplace_back(&sharedResult, &status, &done, requestVersion);
 
         _groups[ns] = std::move(group);
 
@@ -121,95 +123,66 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
             _stats.activeGroups = _groups.size();
         }
 
-        // Wait for coalescing window
-        _cv.wait_for(lock, windowDuration.toSystemDuration(), [this, &ns]() {
-            return _shutdown || _groups.find(ns) == _groups.end() ||
-                   _groups[ns]->queryCompleted;
-        });
+        // ========== 立即执行查询（无窗口等待）==========
+        lock.unlock();
 
-        // Check if we're still the leader
+        LOG(2) << "ConfigQueryCoalescer: leader executing query for ns=" << ns;
+        auto queryResult = queryFunc();
+
+        // ========== 重新获取锁，分发结果 ==========
+        lock.lock();
+
         it = _groups.find(ns);
-        if (it != _groups.end() && !it->second->queryInProgress && !it->second->queryCompleted) {
-            it->second->queryInProgress = true;
+        if (it != _groups.end()) {
+            CoalescingGroup* grp = it->second.get();
+            grp->queryCompleted = true;
 
-            // Release lock and execute query
-            lock.unlock();
-
-            LOG(2) << "ConfigQueryCoalescer: leader executing query for ns=" << ns;
-
-            auto queryResult = queryFunc();
-
-            lock.lock();
-
-            // Store result and notify waiters
-            it = _groups.find(ns);
-            if (it != _groups.end()) {
-                CoalescingGroup* group = it->second.get();
-                group->queryCompleted = true;
-
-                if (queryResult.isOK()) {
-                    group->queryResult = std::move(queryResult.getValue());
-                    group->queryStatus = Status::OK();
-
-                    // Distribute results to all waiters
-                    for (auto& waiter : group->waiters) {
-                        *waiter.resultPtr = group->queryResult;
-                        *waiter.statusPtr = Status::OK();
-                        waiter.done = true;
-                    }
-                } else {
-                    group->queryStatus = queryResult.getStatus();
-
-                    for (auto& waiter : group->waiters) {
-                        *waiter.statusPtr = queryResult.getStatus();
-                        waiter.done = true;
-                    }
-                }
-
-                // Update stats
-                {
-                    stdx::lock_guard<stdx::mutex> slock(_statsMutex);
-                    _stats.actualQueries++;
-                }
-
-                // Remove group
-                _groups.erase(it);
-
-                {
-                    stdx::lock_guard<stdx::mutex> slock(_statsMutex);
-                    _stats.activeGroups = _groups.size();
-                }
+            // 创建 shared_ptr 存储结果
+            SharedResult resultPtr;
+            Status resultStatus = Status::OK();
+            if (queryResult.isOK()) {
+                resultPtr = std::make_shared<std::vector<BSONObj>>(
+                    std::move(queryResult.getValue()));
+            } else {
+                resultStatus = queryResult.getStatus();
             }
 
-            _cv.notify_all();
-        } else {
-            // Wait for result from another leader
-            _cv.wait(lock, [this, &ns, &result]() {
-                auto git = _groups.find(ns);
-                if (git == _groups.end()) return true;
-                if (_shutdown) return true;
-
-                for (auto& w : git->second->waiters) {
-                    if (w.resultPtr == &result && w.done) {
-                        return true;
-                    }
+            // 分发结果给所有等待者（包括自己）
+            for (auto& w : grp->waiters) {
+                if (resultPtr) {
+                    *w.sharedResultPtr = resultPtr;
                 }
-                return git->second->queryCompleted;
-            });
+                *w.statusPtr = resultStatus;
+                w.donePtr->store(true, std::memory_order_release);
+            }
+
+            // 删除 group
+            _groups.erase(it);
+
+            {
+                stdx::lock_guard<stdx::mutex> slock(_statsMutex);
+                _stats.actualQueries++;
+                _stats.activeGroups = _groups.size();
+            }
         }
 
         lock.unlock();
+        _cv.notify_all();
 
+        // 返回结果
         if (!status.isOK()) {
             return status;
         }
-        return result;
+        if (sharedResult) {
+            return *sharedResult;
+        }
+        return std::vector<BSONObj>();
     }
 
-    // Case 2: Existing group, join as follower
+    // Case 2: Existing group - 加入等待队列，复用结果
     CoalescingGroup* group = it->second.get();
 
-    // Check version gap - if too large, execute independently
+    // 检查版本差距 - 如果太大，独立执行
     uint64_t newMinVersion = std::min(group->minVersion, requestVersion);
     uint64_t newMaxVersion = std::max(group->maxVersion, requestVersion);
     if (newMaxVersion - newMinVersion > maxVersionGap) {
@@ -221,17 +194,11 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
             _stats.actualQueries++;
         }
 
-        LOG(2) << "ConfigQueryCoalescer: version gap too large ("
-               << (newMaxVersion - newMinVersion) << " > " << maxVersionGap
-               << "), executing independent query for ns=" << ns;
+        LOG(2) << "ConfigQueryCoalescer: version gap too large, executing independent query for ns=" << ns;
         return queryFunc();
     }
 
-    // Update version range
-    group->minVersion = newMinVersion;
-    group->maxVersion = newMaxVersion;
-
-    // Check overflow
+    // 检查等待者数量限制
     if (group->waiters.size() >= maxWaiters) {
         lock.unlock();
 
@@ -245,40 +212,109 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
         return queryFunc();
     }
 
-    // Join waiting queue
-    group->waiters.emplace_back(&result, &status, requestVersion);
+    // 加入等待队列，复用 leader 的查询结果
+    group->waiters.emplace_back(&sharedResult, &status, &done, requestVersion);
 
     {
         stdx::lock_guard<stdx::mutex> slock(_statsMutex);
         _stats.coalescedRequests++;
     }
 
-    // Wait for result
-    bool timedOut = !_cv.wait_for(lock, maxWait.toSystemDuration(),
-        [this, &ns, &result]() {
-            if (_shutdown) return true;
+    // 等待 leader 完成查询
+    Milliseconds maxTotalWait = _config.maxTotalWaitTime;
+    Date_t startTime = Date_t::now();
+
+    while (true) {
+        Milliseconds elapsed = Date_t::now() - startTime;
+        if (elapsed >= maxTotalWait) {
+            // 总超时
             auto git = _groups.find(ns);
-            if (git == _groups.end()) return true;
-
-            for (auto& w : git->second->waiters) {
-                if (w.resultPtr == &result && w.done) {
-                    return true;
-                }
+            if (git != _groups.end()) {
+                git->second->waiters.remove_if([&done](const Waiter& w) {
+                    return w.donePtr == &done;
+                });
             }
-            return false;
-        });
 
-    if (timedOut) {
-        stdx::lock_guard<stdx::mutex> slock(_statsMutex);
-        _stats.timeoutRequests++;
+            {
+                stdx::lock_guard<stdx::mutex> slock(_statsMutex);
+                _stats.timeoutRequests++;
+            }
+
+            lock.unlock();
+            return Status(ErrorCodes::ExceededTimeLimit,
+                          str::stream() << "Coalescing wait timed out for " << ns);
+        }
+
+        Milliseconds remainingTime = maxTotalWait - elapsed;
+        Milliseconds waitTime = std::min(maxWait, remainingTime);
+
+        bool timedOut = !_cv.wait_for(lock, waitTime.toSystemDuration(),
+            [&done, this]() {
+                if (_shutdown) return true;
+                return done.load(std::memory_order_acquire);
+            });
+
+        if (done.load(std::memory_order_acquire) || _shutdown) {
+            break;
+        }
+
+        // 单次超时但未完成，尝试升级为 leader
+        if (timedOut) {
+            auto git = _groups.find(ns);
+            if (git != _groups.end() && !git->second->queryInProgress && !git->second->queryCompleted) {
+                // 升级为 leader
+                git->second->queryInProgress = true;
+
+                git->second->waiters.remove_if([&done](const Waiter& w) {
+                    return w.donePtr == &done;
+                });
+
+                LOG(2) << "ConfigQueryCoalescer: follower promoted to leader for ns=" << ns;
+
+                lock.unlock();
+                auto queryResult = queryFunc();
+                lock.lock();
+
+                git = _groups.find(ns);
+                if (git != _groups.end()) {
+                    CoalescingGroup* grp = git->second.get();
+                    grp->queryCompleted = true;
+
+                    SharedResult resultPtr;
+                    Status resultStatus = Status::OK();
+                    if (queryResult.isOK()) {
+                        resultPtr = std::make_shared<std::vector<BSONObj>>(
+                            std::move(queryResult.getValue()));
+                    } else {
+                        resultStatus = queryResult.getStatus();
+                    }
+
+                    for (auto& w : grp->waiters) {
+                        if (resultPtr) {
+                            *w.sharedResultPtr = resultPtr;
+                        }
+                        *w.statusPtr = resultStatus;
+                        w.donePtr->store(true, std::memory_order_release);
+                    }
+
+                    _groups.erase(git);
+
+                    {
+                        stdx::lock_guard<stdx::mutex> slock(_statsMutex);
+                        _stats.actualQueries++;
+                        _stats.activeGroups = _groups.size();
+                    }
+                }
+
+                lock.unlock();
+                _cv.notify_all();
+
+                return queryResult;
+            }
+        }
     }
 
     lock.unlock();
-
-    if (timedOut) {
-        return Status(ErrorCodes::ExceededTimeLimit,
-                      str::stream() << "Coalescing wait timed out for " << ns);
-    }
 
     if (_shutdown) {
         return Status(ErrorCodes::ShutdownInProgress,
@@ -288,8 +324,10 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
     if (!status.isOK()) {
         return status;
     }
-
-    return result;
+    if (sharedResult) {
+        return *sharedResult;
+    }
+    return std::vector<BSONObj>();
 }
 
 ConfigQueryCoalescer::Stats ConfigQueryCoalescer::getStats() const {
@@ -310,7 +348,7 @@ void ConfigQueryCoalescer::shutdown() {
         for (auto& waiter : pair.second->waiters) {
             *waiter.statusPtr = Status(ErrorCodes::ShutdownInProgress,
                                        "ConfigQueryCoalescer is shutting down");
-            waiter.done = true;
+            waiter.donePtr->store(true, std::memory_order_release);
         }
     }
 

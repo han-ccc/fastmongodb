@@ -57,18 +57,19 @@
 
 **功能**:
 - 在 Config Server 侧合并来自多个 mongos 的路由查询请求
-- 合并窗口 (5-20ms) 内同一 namespace 的请求合并为一次查询
-- 版本过滤：使用最小版本执行查询，结果按各请求的版本过滤分发
-- 自适应窗口：根据负载动态调整窗口大小
+- **无窗口等待**：第一个请求立即执行，后续请求复用结果（无延迟）
+- Leader/Follower 模式：第一个请求成为 leader 执行查询，后续请求等待结果
+- 版本差距检测：版本差距 > 500 的请求独立执行，避免结果过期
+- 连接池复用：200-300 个共享连接，减少连接开销
 
-**核心价值**: 查询次数 = collection 数量，与 mongos 数量解耦
+**核心价值**:
+- 查询次数 ≈ collection 数量，与 mongos 数量解耦
+- 高合并率场景 QPS 提升 **2.66x**，CPU 降低 **72%**
 
 **文件**:
-- [x] `src/mongo/s/catalog/config_query_coalescer.h` - 合并器接口
-- [x] `src/mongo/s/catalog/config_query_coalescer.cpp` - 合并器实现
-- [x] `src/mongo/s/catalog/config_query_coalescer_test.cpp` - 单元测试
-- [x] `src/mongo/s/catalog/config_query_coalescer_benchmark.cpp` - 性能基准
-- [x] `src/mongo/s/catalog/config_query_coalescer_standalone_test.cpp` - 独立验证
+- [x] `src/mongo/db/s/config/config_query_coalescer.h` - 合并器接口
+- [x] `src/mongo/db/s/config/config_query_coalescer.cpp` - 合并器实现 (无窗口等待优化)
+- [x] `src/mongo/s/catalog/coalescer_e2e_stress_test.cpp` - E2E 压力测试 (多场景对比)
 
 **测试结果**:
 
@@ -87,6 +88,23 @@
 | 3000 | 11,824 | 100.00% | OK |
 | 4000 | 11,428 | 100.00% | OK |
 | 5000 | 11,425 | 99.76% | LIMIT (TCP 端口耗尽) |
+
+**无窗口优化压测** (2024-12-23):
+
+优化策略：移除 20ms 合并窗口，第一个请求立即执行，后续请求复用结果
+
+| 场景 | 线程 | QPS | 延迟 | CPU | 合并率 | vs RANDOM |
+|------|------|-----|------|-----|--------|-----------|
+| SAME_VERSION | 1000 | **23,336** | 41ms | 25.8% | 80.3% | **2.66x** |
+| CLOSE_VERSIONS | 1000 | 21,890 | 44ms | 28.1% | 75.2% | 2.50x |
+| BOUNDARY_GAP | 1000 | 15,420 | 62ms | 45.3% | 52.1% | 1.76x |
+| HOTSPOT_MIX | 1000 | 12,100 | 79ms | 68.2% | 35.6% | 1.38x |
+| RANDOM | 1000 | 8,771 | 108ms | 95.0% | 7.8% | baseline |
+
+**关键结论**:
+- 高合并率场景 (SAME_VERSION) QPS 提升 **166%**，延迟降低 **62%**
+- CPU 使用率从 95% 降至 25.8%，有更大的扩展空间
+- 合并器有效减轻 Config Server 压力，每 100 个请求只执行 ~20 次实际查询
 
 **测试环境**: 104 collections, 100,000 chunks (50k大表 + 2×20k中表 + 9k小表 + 100×10微表)
 
@@ -201,6 +219,7 @@ ConfigDiffTracker.configDiffQuery():
 | 2024-12-16 | - | Batch Query 完成 |
 | 2024-12-16 | - | 删除重复模块 (request_coalescer, chunk_delta) |
 | 2024-12-20 | `1194148c605` | Shard Key Fast Path 完成 |
+| 2024-12-23 | `a2391ffa828` | ConfigQueryCoalescer 完整实现与压测 (无窗口优化, 2.66x QPS提升) |
 
 ---
 
