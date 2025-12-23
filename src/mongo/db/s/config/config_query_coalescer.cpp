@@ -25,13 +25,136 @@ std::atomic<bool> configQueryCoalescerEnabled{false};
 std::atomic<int> configQueryCoalescerWindowMS{5};
 std::atomic<int> configQueryCoalescerMaxWaitMS{100};
 std::atomic<int> configQueryCoalescerMaxWaiters{1000};
-std::atomic<long long> configQueryCoalescerMaxVersionGap{500};  // 版本差距阈值
+std::atomic<long long> configQueryCoalescerMaxVersionGap{500};
 
-MONGO_EXPORT_SERVER_PARAMETER(configQueryCoalescerEnabledParam, bool, false);
-MONGO_EXPORT_SERVER_PARAMETER(configQueryCoalescerWindowMSParam, int, 5);
-MONGO_EXPORT_SERVER_PARAMETER(configQueryCoalescerMaxWaitMSParam, int, 100);
-MONGO_EXPORT_SERVER_PARAMETER(configQueryCoalescerMaxWaitersParam, int, 1000);
-MONGO_EXPORT_SERVER_PARAMETER(configQueryCoalescerMaxVersionGapParam, long long, 500);
+// ============================================================================
+// Custom ServerParameter classes - 修复 #18 (参数断开) 和 #19 (缺少验证)
+// ============================================================================
+
+// Bool parameter - 连接到 atomic<bool>
+class CoalescerEnabledParameter : public ServerParameter {
+public:
+    CoalescerEnabledParameter()
+        : ServerParameter(ServerParameterSet::getGlobal(),
+                          "configQueryCoalescerEnabled",
+                          true,   // allowedToChangeAtStartup
+                          true) { // allowedToChangeAtRuntime
+    }
+
+    void append(OperationContext*, BSONObjBuilder& b, const std::string& name) override {
+        b.append(name, configQueryCoalescerEnabled.load());
+    }
+
+    Status set(const BSONElement& newValueElement) override {
+        if (newValueElement.type() != Bool) {
+            return Status(ErrorCodes::TypeMismatch, "configQueryCoalescerEnabled must be a boolean");
+        }
+        configQueryCoalescerEnabled.store(newValueElement.Bool());
+        return Status::OK();
+    }
+
+    Status setFromString(const std::string& str) override {
+        if (str == "true" || str == "1") {
+            configQueryCoalescerEnabled.store(true);
+        } else if (str == "false" || str == "0") {
+            configQueryCoalescerEnabled.store(false);
+        } else {
+            return Status(ErrorCodes::BadValue, "configQueryCoalescerEnabled must be 'true' or 'false'");
+        }
+        return Status::OK();
+    }
+} coalescerEnabledParameter;
+
+// Int parameter with validation - 连接到 atomic<int>，带范围验证
+template <std::atomic<int>* atomicVar, int minVal, int maxVal>
+class CoalescerIntParameter : public ServerParameter {
+public:
+    CoalescerIntParameter(const std::string& name)
+        : ServerParameter(ServerParameterSet::getGlobal(), name, true, true) {}
+
+    void append(OperationContext*, BSONObjBuilder& b, const std::string& name) override {
+        b.append(name, atomicVar->load());
+    }
+
+    Status set(const BSONElement& newValueElement) override {
+        if (!newValueElement.isNumber()) {
+            return Status(ErrorCodes::TypeMismatch, name() + " must be a number");
+        }
+        int newValue = newValueElement.numberInt();
+        if (newValue < minVal || newValue > maxVal) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << name() << " must be between " << minVal << " and " << maxVal);
+        }
+        atomicVar->store(newValue);
+        return Status::OK();
+    }
+
+    Status setFromString(const std::string& str) override {
+        int newValue;
+        try {
+            newValue = std::stoi(str);
+        } catch (...) {
+            return Status(ErrorCodes::BadValue, name() + " must be a valid integer");
+        }
+        if (newValue < minVal || newValue > maxVal) {
+            return Status(ErrorCodes::BadValue,
+                          str::stream() << name() << " must be between " << minVal << " and " << maxVal);
+        }
+        atomicVar->store(newValue);
+        return Status::OK();
+    }
+};
+
+// Long long parameter with validation
+class CoalescerMaxVersionGapParameter : public ServerParameter {
+public:
+    CoalescerMaxVersionGapParameter()
+        : ServerParameter(ServerParameterSet::getGlobal(),
+                          "configQueryCoalescerMaxVersionGap",
+                          true, true) {}
+
+    void append(OperationContext*, BSONObjBuilder& b, const std::string& name) override {
+        b.append(name, configQueryCoalescerMaxVersionGap.load());
+    }
+
+    Status set(const BSONElement& newValueElement) override {
+        if (!newValueElement.isNumber()) {
+            return Status(ErrorCodes::TypeMismatch, "configQueryCoalescerMaxVersionGap must be a number");
+        }
+        long long newValue = newValueElement.numberLong();
+        if (newValue < 1 || newValue > 100000) {
+            return Status(ErrorCodes::BadValue,
+                          "configQueryCoalescerMaxVersionGap must be between 1 and 100000");
+        }
+        configQueryCoalescerMaxVersionGap.store(newValue);
+        return Status::OK();
+    }
+
+    Status setFromString(const std::string& str) override {
+        long long newValue;
+        try {
+            newValue = std::stoll(str);
+        } catch (...) {
+            return Status(ErrorCodes::BadValue, "configQueryCoalescerMaxVersionGap must be a valid integer");
+        }
+        if (newValue < 1 || newValue > 100000) {
+            return Status(ErrorCodes::BadValue,
+                          "configQueryCoalescerMaxVersionGap must be between 1 and 100000");
+        }
+        configQueryCoalescerMaxVersionGap.store(newValue);
+        return Status::OK();
+    }
+} coalescerMaxVersionGapParameter;
+
+// 实例化参数对象
+CoalescerIntParameter<&configQueryCoalescerWindowMS, 1, 1000>
+    coalescerWindowMSParameter("configQueryCoalescerWindowMS");
+
+CoalescerIntParameter<&configQueryCoalescerMaxWaitMS, 10, 60000>
+    coalescerMaxWaitMSParameter("configQueryCoalescerMaxWaitMS");
+
+CoalescerIntParameter<&configQueryCoalescerMaxWaiters, 1, 100000>
+    coalescerMaxWaitersParameter("configQueryCoalescerMaxWaiters");
 
 // ============================================================================
 // Stats Implementation

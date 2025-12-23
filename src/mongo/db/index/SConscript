@@ -76,6 +76,17 @@ env.CppUnitTest(
         ],
 )
 
+env.CppUnitTest(
+        target='unified_field_extractor_test',
+        source=[
+            'unified_field_extractor_test.cpp',
+        ],
+        LIBDEPS=[
+            '$BUILD_DIR/mongo/base',
+            '$BUILD_DIR/mongo/db/bson/dotted_path_support',
+        ],
+)
+
 serveronlyEnv = env.Clone()
 serveronlyEnv.InjectThirdPartyIncludePaths(libraries=['snappy'])
 serveronlyEnv.Library(
