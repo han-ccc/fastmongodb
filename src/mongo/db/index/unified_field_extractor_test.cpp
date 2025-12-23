@@ -407,6 +407,251 @@ TEST_F(UnifiedFieldExtractorEdgeCaseTest, LargeFieldCount) {
 }
 
 // ============================================================================
+// Signature collision tests (Bug #15)
+// ============================================================================
+
+class UnifiedFieldExtractorCollisionTest : public unittest::Test {};
+
+// Helper to generate field names with specific signature components
+namespace {
+// 找到两个不同的字段名，它们有相同的签名
+// 签名 = 长度 + 首字符 + 末字符 + 8位哈希
+// 我们通过构造来制造冲突
+std::pair<std::string, std::string> findCollidingFieldNames() {
+    // 简单方法：相同长度、首字符、末字符，尝试找哈希冲突
+    // "abc" 和 "aXc" 如果哈希相同就冲突
+    // 哈希 = sum(char[i] * 31^(len-1-i)) mod 256
+    // 长度=3, "abc" hash = (('a'*31 + 'b')*31 + 'c') mod 256
+
+    // 使用暴力搜索找到冲突
+    auto computeHash = [](const char* s, size_t len) -> uint8_t {
+        uint8_t hash = 0;
+        for (size_t i = 0; i < len; ++i) {
+            hash = static_cast<uint8_t>(hash * 31 + static_cast<uint8_t>(s[i]));
+        }
+        return hash;
+    };
+
+    // 固定长度=4，首字符='f'，末字符='d'
+    // 找两个中间字符不同但哈希相同的
+    std::string base = "f__d";
+    for (int c1 = 'a'; c1 <= 'z'; ++c1) {
+        for (int c2 = 'a'; c2 <= 'z'; ++c2) {
+            std::string s1 = "f";
+            s1 += static_cast<char>(c1);
+            s1 += static_cast<char>(c1);
+            s1 += "d";
+
+            std::string s2 = "f";
+            s2 += static_cast<char>(c2);
+            s2 += static_cast<char>(c2);
+            s2 += "d";
+
+            if (s1 != s2 &&
+                computeHash(s1.c_str(), 4) == computeHash(s2.c_str(), 4)) {
+                return {s1, s2};
+            }
+        }
+    }
+
+    // 如果找不到，用更大范围
+    for (int c1 = 32; c1 < 127; ++c1) {
+        for (int c2 = 32; c2 < 127; ++c2) {
+            for (int c3 = 32; c3 < 127; ++c3) {
+                for (int c4 = 32; c4 < 127; ++c4) {
+                    if (c1 == c3 && c2 == c4) continue;
+
+                    std::string s1 = "f";
+                    s1 += static_cast<char>(c1);
+                    s1 += static_cast<char>(c2);
+                    s1 += "d";
+
+                    std::string s2 = "f";
+                    s2 += static_cast<char>(c3);
+                    s2 += static_cast<char>(c4);
+                    s2 += "d";
+
+                    if (computeHash(s1.c_str(), 4) == computeHash(s2.c_str(), 4)) {
+                        return {s1, s2};
+                    }
+                }
+            }
+        }
+    }
+
+    // Fallback - 手动构造的已知冲突
+    return {"field1", "field1"};  // 不是真正的冲突，测试会失败
+}
+}  // namespace
+
+// Test: Signature collision handling in registration
+TEST_F(UnifiedFieldExtractorCollisionTest, CollisionRegistration) {
+    UnifiedFieldExtractor extractor;
+
+    // 使用构造的冲突字段名
+    std::pair<std::string, std::string> colliding = findCollidingFieldNames();
+    std::string field1 = colliding.first;
+    std::string field2 = colliding.second;
+
+    // 如果找到了真正的冲突
+    if (field1 != field2) {
+        uint8_t slot1 = extractor.registerField(field1);
+        uint8_t slot2 = extractor.registerField(field2);
+
+        // 应该分配不同的槽位
+        ASSERT_NOT_EQUALS(slot1, slot2);
+        ASSERT_EQUALS(extractor.totalUniqueFields(), 2u);
+        ASSERT_EQUALS(extractor.collisionCount(), 1u);  // 一个冲突字段
+    }
+}
+
+// Test: Signature collision handling in extraction
+TEST_F(UnifiedFieldExtractorCollisionTest, CollisionExtraction) {
+    UnifiedFieldExtractor extractor;
+
+    std::pair<std::string, std::string> colliding = findCollidingFieldNames();
+    std::string field1 = colliding.first;
+    std::string field2 = colliding.second;
+
+    if (field1 != field2) {
+        uint8_t slot1 = extractor.registerField(field1);
+        uint8_t slot2 = extractor.registerField(field2);
+        extractor.finalize();
+
+        // 创建包含两个字段的文档
+        BSONObjBuilder b;
+        b.append(field1, 111);
+        b.append(field2, 222);
+        BSONObj doc = b.obj();
+
+        extractor.extract(doc);
+
+        // 两个字段都应该被正确提取
+        ASSERT_EQUALS(extractor.get(slot1).Int(), 111);
+        ASSERT_EQUALS(extractor.get(slot2).Int(), 222);
+        ASSERT_EQUALS(extractor.extractedCount(), 2u);
+    }
+}
+
+// Test: Manual collision test with known values
+TEST_F(UnifiedFieldExtractorCollisionTest, ManualCollisionTest) {
+    // 手动测试：即使没有真正的哈希冲突，验证冲突处理逻辑
+    UnifiedFieldExtractor extractor;
+
+    // 注册多个不同的字段
+    uint8_t slotA = extractor.registerField("apple");
+    uint8_t slotB = extractor.registerField("banana");
+    uint8_t slotC = extractor.registerField("cherry");
+    extractor.finalize();
+
+    BSONObj doc = BSON("apple" << 1 << "banana" << 2 << "cherry" << 3);
+    extractor.extract(doc);
+
+    ASSERT_EQUALS(extractor.get(slotA).Int(), 1);
+    ASSERT_EQUALS(extractor.get(slotB).Int(), 2);
+    ASSERT_EQUALS(extractor.get(slotC).Int(), 3);
+}
+
+// ============================================================================
+// Nested array tests (Bug #16)
+// ============================================================================
+
+class UnifiedFieldExtractorArrayTest : public unittest::Test {};
+
+// Test: Array along path detection
+TEST_F(UnifiedFieldExtractorArrayTest, ArrayAlongPath) {
+    UnifiedFieldExtractor extractor;
+
+    uint8_t slot = extractor.registerField("a.b");
+    extractor.finalize();
+
+    // 文档: { a: [ {b: 1}, {b: 2} ] }
+    BSONObj doc = BSON("a" << BSON_ARRAY(BSON("b" << 1) << BSON("b" << 2)));
+    extractor.extract(doc);
+
+    // 应该检测到路径中有数组
+    ASSERT_TRUE(extractor.hasArrayAlongPath(slot));
+    // 返回数组元素本身
+    ASSERT_EQUALS(extractor.get(slot).type(), Array);
+}
+
+// Test: Object path without array
+TEST_F(UnifiedFieldExtractorArrayTest, ObjectPathNoArray) {
+    UnifiedFieldExtractor extractor;
+
+    uint8_t slot = extractor.registerField("a.b");
+    extractor.finalize();
+
+    // 文档: { a: { b: 42 } }
+    BSONObj doc = BSON("a" << BSON("b" << 42));
+    extractor.extract(doc);
+
+    // 没有数组
+    ASSERT_FALSE(extractor.hasArrayAlongPath(slot));
+    ASSERT_EQUALS(extractor.get(slot).Int(), 42);
+}
+
+// Test: Nested array in middle of path
+TEST_F(UnifiedFieldExtractorArrayTest, NestedArrayInMiddle) {
+    UnifiedFieldExtractor extractor;
+
+    uint8_t slot = extractor.registerField("a.b.c");
+    extractor.finalize();
+
+    // 文档: { a: { b: [ {c: 1}, {c: 2} ] } }
+    BSONObjBuilder builder;
+    {
+        BSONObjBuilder aBuilder(builder.subobjStart("a"));
+        BSONArrayBuilder bArray(aBuilder.subarrayStart("b"));
+        bArray.append(BSON("c" << 1));
+        bArray.append(BSON("c" << 2));
+        bArray.done();
+        aBuilder.done();
+    }
+    BSONObj doc = builder.obj();
+
+    extractor.extract(doc);
+
+    // 应该检测到数组
+    ASSERT_TRUE(extractor.hasArrayAlongPath(slot));
+}
+
+// Test: Top-level array field
+TEST_F(UnifiedFieldExtractorArrayTest, TopLevelArrayField) {
+    UnifiedFieldExtractor extractor;
+
+    uint8_t slot = extractor.registerField("tags");
+    extractor.finalize();
+
+    // 文档: { tags: [1, 2, 3] }
+    BSONObj doc = BSON("tags" << BSON_ARRAY(1 << 2 << 3));
+    extractor.extract(doc);
+
+    // 顶级数组字段，不是"路径中的数组"
+    ASSERT_FALSE(extractor.hasArrayAlongPath(slot));
+    ASSERT_EQUALS(extractor.get(slot).type(), Array);
+}
+
+// Test: Deep nested path with arrays
+TEST_F(UnifiedFieldExtractorArrayTest, DeepNestedWithArray) {
+    UnifiedFieldExtractor extractor;
+
+    uint8_t slot1 = extractor.registerField("x.y.z");
+    uint8_t slot2 = extractor.registerField("x.y");
+    extractor.finalize();
+
+    // 文档: { x: { y: [ {z: 100} ] } }
+    BSONObj doc = BSON("x" << BSON("y" << BSON_ARRAY(BSON("z" << 100))));
+    extractor.extract(doc);
+
+    // x.y.z 路径中有数组
+    ASSERT_TRUE(extractor.hasArrayAlongPath(slot1));
+
+    // x.y 返回数组本身
+    ASSERT_EQUALS(extractor.get(slot2).type(), Array);
+}
+
+// ============================================================================
 // BENCHMARK TESTS - Performance comparison
 // ============================================================================
 

@@ -2,32 +2,24 @@
  * Copyright (C) 2017 MongoDB Inc.
  *
  * Sharding Optimization Parameters Implementation
+ *
+ * NOTE: 主要的 Coalescer 参数已移至 config_query_coalescer.cpp
+ * 这里保留变量定义以保持头文件兼容性，但不再注册重复的 ServerParameter
  */
 
 #include "mongo/platform/basic.h"
 
 #include "mongo/s/catalog/sharding_optimization_parameters.h"
 
-#include "mongo/db/server_parameters.h"
-
 namespace mongo {
 
-// ConfigQueryCoalescer enabled flag - default disabled
+// 这些变量保留用于向后兼容，但实际使用的是 config_query_coalescer.cpp 中的变量
+// 推荐直接使用 configQueryCoalescer* 系列参数
 std::atomic<bool> shardingConfigCoalescerEnabled{false};
-
-// Coalescing window in milliseconds - default 10ms
 std::atomic<int> shardingConfigCoalescerWindowMS{10};
-
-// Maximum wait time in milliseconds - default 200ms
 std::atomic<int> shardingConfigCoalescerMaxWaitMS{200};
-
-// Maximum waiters per group - default 500
 std::atomic<int> shardingConfigCoalescerMaxWaiters{500};
 
-// Server parameters for runtime configuration
-MONGO_EXPORT_SERVER_PARAMETER(shardingConfigCoalescerEnabledParam, bool, false);
-MONGO_EXPORT_SERVER_PARAMETER(shardingConfigCoalescerWindowMSParam, int, 10);
-MONGO_EXPORT_SERVER_PARAMETER(shardingConfigCoalescerMaxWaitMSParam, int, 200);
-MONGO_EXPORT_SERVER_PARAMETER(shardingConfigCoalescerMaxWaitersParam, int, 500);
+// ServerParameter 已移至 config_query_coalescer.cpp，避免重复注册
 
 }  // namespace mongo
