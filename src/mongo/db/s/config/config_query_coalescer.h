@@ -143,17 +143,33 @@ private:
     using SharedResult = std::shared_ptr<std::vector<BSONObj>>;
 
     /**
-     * 等待者信息 - 所有指针都指向调用者栈上的变量
-     * 这样可以在删除 group 后仍然安全地访问这些指针
+     * 等待者状态 - 使用 shared_ptr 管理生命周期
+     *
+     * 解决悬空指针问题：
+     * - 调用者和 CoalescingGroup 各持有一份 shared_ptr
+     * - 即使调用者提前返回，shared_ptr 的引用计数保证内存不释放
+     * - 即使 shutdown 清空 groups，通过 shared_ptr 写入仍然安全
+     */
+    struct WaiterState {
+        SharedResult result;
+        Status status{Status::OK()};
+        std::atomic<bool> done{false};
+
+        WaiterState() = default;
+        WaiterState(const WaiterState&) = delete;
+        WaiterState& operator=(const WaiterState&) = delete;
+    };
+    using WaiterStatePtr = std::shared_ptr<WaiterState>;
+
+    /**
+     * 等待者信息
      */
     struct Waiter {
-        SharedResult* sharedResultPtr;   // 指向调用者的 shared_ptr
-        Status* statusPtr;               // 指向调用者的 Status
-        std::atomic<bool>* donePtr;      // 指向调用者的 atomic<bool>
+        WaiterStatePtr state;            // 共享状态，确保生命周期安全
         uint64_t requestedVersion{0};    // 请求的版本号
 
-        Waiter(SharedResult* res, Status* stat, std::atomic<bool>* done, uint64_t version)
-            : sharedResultPtr(res), statusPtr(stat), donePtr(done), requestedVersion(version) {}
+        Waiter(WaiterStatePtr s, uint64_t version)
+            : state(std::move(s)), requestedVersion(version) {}
     };
 
     /**
@@ -161,23 +177,22 @@ private:
      */
     struct CoalescingGroup {
         std::string ns;
-        Date_t windowEnd;
+        uint64_t generation{0};           // 用于检测 group 是否被重建
         uint64_t minVersion{UINT64_MAX};  // 组内最小版本
         uint64_t maxVersion{0};           // 组内最大版本
         bool queryInProgress{false};
         bool queryCompleted{false};
-        SharedResult queryResult;         // 使用 shared_ptr，分发时只复制指针
-        Status queryStatus{Status::OK()};
         std::list<Waiter> waiters;
 
-        explicit CoalescingGroup(const std::string& namespace_)
-            : ns(namespace_), windowEnd(Date_t::now()) {}
+        CoalescingGroup(const std::string& namespace_, uint64_t gen)
+            : ns(namespace_), generation(gen) {}
     };
 
     Config _config;
     mutable stdx::mutex _mutex;
     stdx::condition_variable _cv;
     std::map<std::string, std::unique_ptr<CoalescingGroup>> _groups;
+    uint64_t _nextGeneration{0};  // group generation 计数器
 
     mutable stdx::mutex _statsMutex;
     Stats _stats;

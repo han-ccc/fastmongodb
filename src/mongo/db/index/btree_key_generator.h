@@ -31,6 +31,7 @@
 #include <memory>
 #include <set>
 #include <vector>
+#include <cstring>
 
 #include "mongo/bson/bsonobj_comparator_interface.h"
 #include "mongo/db/index/index_descriptor.h"
@@ -40,6 +41,36 @@
 namespace mongo {
 
 class CollatorInterface;
+
+/**
+ * 字段偏移量缓存 - 用于跨索引共享已提取的字段
+ *
+ * 使用方式：
+ *   FieldOffsetCache cache;
+ *   for (auto& index : indexes) {
+ *       index.getKeys(doc, &keys, &multikeyPaths, &cache);
+ *   }
+ *
+ * 缓存在同一文档的多个索引之间共享，避免重复遍历文档。
+ * 每个文档应该使用独立的缓存实例，请求结束后自动释放。
+ */
+struct FieldOffsetCache {
+    const char* docPtr = nullptr;
+    uint32_t docSize = 0;
+    uint32_t offsets[256] = {};
+
+    FieldOffsetCache() = default;
+
+    void init(const char* ptr, uint32_t size) {
+        docPtr = ptr;
+        docSize = size;
+        std::memset(offsets, 0, sizeof(offsets));
+    }
+
+    bool isValidFor(const char* ptr, uint32_t size) const {
+        return docPtr == ptr && docSize == size;
+    }
+};
 
 /**
  * Internal class used by BtreeAccessMethod to generate keys for indexed documents.
@@ -59,7 +90,20 @@ public:
                                                    bool isSparse,
                                                    const CollatorInterface* collator);
 
-    void getKeys(const BSONObj& obj, BSONObjSet* keys, MultikeyPaths* multikeyPaths) const;
+    /**
+     * 为文档生成索引键
+     *
+     * @param obj - 要索引的文档
+     * @param keys - 输出的索引键集合
+     * @param multikeyPaths - 多键路径信息（可选）
+     * @param cache - 字段偏移量缓存（可选）
+     *                如果提供，可以跨多个索引共享已提取的字段
+     *                如果不提供，内部会创建临时缓存
+     */
+    void getKeys(const BSONObj& obj,
+                 BSONObjSet* keys,
+                 MultikeyPaths* multikeyPaths,
+                 FieldOffsetCache* cache = nullptr) const;
 
 protected:
     // These are used by the getKeysImpl(s) below.
@@ -74,7 +118,8 @@ private:
                              std::vector<BSONElement> fixed,
                              const BSONObj& obj,
                              BSONObjSet* keys,
-                             MultikeyPaths* multikeyPaths) const = 0;
+                             MultikeyPaths* multikeyPaths,
+                             FieldOffsetCache* cache) const = 0;
 
     std::vector<BSONElement> _fixed;
 };
@@ -99,7 +144,8 @@ private:
                      std::vector<BSONElement> fixed,
                      const BSONObj& obj,
                      BSONObjSet* keys,
-                     MultikeyPaths* multikeyPaths) const final;
+                     MultikeyPaths* multikeyPaths,
+                     FieldOffsetCache* cache) const final;
 };
 
 class BtreeKeyGeneratorV1 : public BtreeKeyGenerator {
@@ -184,7 +230,8 @@ private:
                      std::vector<BSONElement> fixed,
                      const BSONObj& obj,
                      BSONObjSet* keys,
-                     MultikeyPaths* multikeyPaths) const final;
+                     MultikeyPaths* multikeyPaths,
+                     FieldOffsetCache* cache) const final;
 
     /**
      * This recursive method does the heavy-lifting for getKeysImpl().

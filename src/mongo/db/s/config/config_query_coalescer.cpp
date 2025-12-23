@@ -93,13 +93,11 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
         _stats.totalRequests++;
     }
 
-    // 所有数据都在调用者栈上，可以在锁外安全访问
-    SharedResult sharedResult;
-    Status status = Status::OK();
-    std::atomic<bool> done{false};
+    // 创建共享状态（在堆上，生命周期由 shared_ptr 管理）
+    // 解决悬空指针问题：即使调用者提前返回，shared_ptr 保证内存不释放
+    auto waiterState = std::make_shared<WaiterState>();
 
     // Use instance config
-    Milliseconds windowDuration = _config.coalescingWindow;
     Milliseconds maxWait = _config.maxWaitTime;
     size_t maxWaiters = _config.maxWaitersPerGroup;
     uint64_t maxVersionGap = _config.maxVersionGap;
@@ -110,11 +108,12 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
 
     // Case 1: No existing group → 创建 group，立即执行查询（无窗口等待）
     if (it == _groups.end()) {
-        auto group = stdx::make_unique<CoalescingGroup>(ns);
+        uint64_t myGeneration = ++_nextGeneration;
+        auto group = stdx::make_unique<CoalescingGroup>(ns, myGeneration);
         group->minVersion = requestVersion;
         group->maxVersion = requestVersion;
         group->queryInProgress = true;  // 立即标记为执行中
-        group->waiters.emplace_back(&sharedResult, &status, &done, requestVersion);
+        group->waiters.emplace_back(waiterState, requestVersion);
 
         _groups[ns] = std::move(group);
 
@@ -132,8 +131,16 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
         // ========== 重新获取锁，分发结果 ==========
         lock.lock();
 
+        // 检查 shutdown（修复 #12）
+        if (_shutdown) {
+            lock.unlock();
+            return Status(ErrorCodes::ShutdownInProgress,
+                          "ConfigQueryCoalescer is shutting down");
+        }
+
+        // 用 generation 验证是同一个 group（修复 #3）
         it = _groups.find(ns);
-        if (it != _groups.end()) {
+        if (it != _groups.end() && it->second->generation == myGeneration) {
             CoalescingGroup* grp = it->second.get();
             grp->queryCompleted = true;
 
@@ -147,13 +154,11 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
                 resultStatus = queryResult.getStatus();
             }
 
-            // 分发结果给所有等待者（包括自己）
+            // 分发结果给所有等待者（通过 shared_ptr，安全）
             for (auto& w : grp->waiters) {
-                if (resultPtr) {
-                    *w.sharedResultPtr = resultPtr;
-                }
-                *w.statusPtr = resultStatus;
-                w.donePtr->store(true, std::memory_order_release);
+                w.state->result = resultPtr;
+                w.state->status = resultStatus;
+                w.state->done.store(true, std::memory_order_release);
             }
 
             // 删除 group
@@ -165,22 +170,24 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
                 _stats.activeGroups = _groups.size();
             }
         }
+        // 如果 generation 不匹配，说明 group 被重建了，我们的 waiters 已经被其他 leader 处理
 
         lock.unlock();
         _cv.notify_all();
 
-        // 返回结果
-        if (!status.isOK()) {
-            return status;
+        // 从自己的 waiterState 读取结果（安全，因为是 shared_ptr）
+        if (!waiterState->status.isOK()) {
+            return waiterState->status;
         }
-        if (sharedResult) {
-            return *sharedResult;
+        if (waiterState->result) {
+            return *waiterState->result;
         }
         return std::vector<BSONObj>();
     }
 
     // Case 2: Existing group - 加入等待队列，复用结果
     CoalescingGroup* group = it->second.get();
+    uint64_t groupGeneration = group->generation;  // 记住当前 generation
 
     // 检查版本差距 - 如果太大，独立执行
     uint64_t newMinVersion = std::min(group->minVersion, requestVersion);
@@ -213,7 +220,7 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
     }
 
     // 加入等待队列，复用 leader 的查询结果
-    group->waiters.emplace_back(&sharedResult, &status, &done, requestVersion);
+    group->waiters.emplace_back(waiterState, requestVersion);
 
     {
         stdx::lock_guard<stdx::mutex> slock(_statsMutex);
@@ -227,11 +234,11 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
     while (true) {
         Milliseconds elapsed = Date_t::now() - startTime;
         if (elapsed >= maxTotalWait) {
-            // 总超时
+            // 总超时 - 从等待队列中移除自己
             auto git = _groups.find(ns);
-            if (git != _groups.end()) {
-                git->second->waiters.remove_if([&done](const Waiter& w) {
-                    return w.donePtr == &done;
+            if (git != _groups.end() && git->second->generation == groupGeneration) {
+                git->second->waiters.remove_if([&waiterState](const Waiter& w) {
+                    return w.state == waiterState;
                 });
             }
 
@@ -249,24 +256,30 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
         Milliseconds waitTime = std::min(maxWait, remainingTime);
 
         bool timedOut = !_cv.wait_for(lock, waitTime.toSystemDuration(),
-            [&done, this]() {
+            [&waiterState, this]() {
                 if (_shutdown) return true;
-                return done.load(std::memory_order_acquire);
+                return waiterState->done.load(std::memory_order_acquire);
             });
 
-        if (done.load(std::memory_order_acquire) || _shutdown) {
+        if (waiterState->done.load(std::memory_order_acquire) || _shutdown) {
             break;
         }
 
         // 单次超时但未完成，尝试升级为 leader
         if (timedOut) {
             auto git = _groups.find(ns);
-            if (git != _groups.end() && !git->second->queryInProgress && !git->second->queryCompleted) {
+            if (git != _groups.end() &&
+                git->second->generation == groupGeneration &&
+                !git->second->queryInProgress &&
+                !git->second->queryCompleted) {
+
                 // 升级为 leader
                 git->second->queryInProgress = true;
+                uint64_t myGeneration = git->second->generation;
 
-                git->second->waiters.remove_if([&done](const Waiter& w) {
-                    return w.donePtr == &done;
+                // 从等待队列中移除自己（作为 leader 直接返回结果）
+                git->second->waiters.remove_if([&waiterState](const Waiter& w) {
+                    return w.state == waiterState;
                 });
 
                 LOG(2) << "ConfigQueryCoalescer: follower promoted to leader for ns=" << ns;
@@ -275,8 +288,16 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
                 auto queryResult = queryFunc();
                 lock.lock();
 
+                // 检查 shutdown（修复 #12）
+                if (_shutdown) {
+                    lock.unlock();
+                    return Status(ErrorCodes::ShutdownInProgress,
+                                  "ConfigQueryCoalescer is shutting down");
+                }
+
+                // 用 generation 验证是同一个 group（修复 #3）
                 git = _groups.find(ns);
-                if (git != _groups.end()) {
+                if (git != _groups.end() && git->second->generation == myGeneration) {
                     CoalescingGroup* grp = git->second.get();
                     grp->queryCompleted = true;
 
@@ -289,12 +310,11 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
                         resultStatus = queryResult.getStatus();
                     }
 
+                    // 分发结果给剩余等待者
                     for (auto& w : grp->waiters) {
-                        if (resultPtr) {
-                            *w.sharedResultPtr = resultPtr;
-                        }
-                        *w.statusPtr = resultStatus;
-                        w.donePtr->store(true, std::memory_order_release);
+                        w.state->result = resultPtr;
+                        w.state->status = resultStatus;
+                        w.state->done.store(true, std::memory_order_release);
                     }
 
                     _groups.erase(git);
@@ -321,11 +341,12 @@ StatusWith<std::vector<BSONObj>> ConfigQueryCoalescer::tryCoalesce(
                       "ConfigQueryCoalescer is shutting down");
     }
 
-    if (!status.isOK()) {
-        return status;
+    // 从自己的 waiterState 读取结果
+    if (!waiterState->status.isOK()) {
+        return waiterState->status;
     }
-    if (sharedResult) {
-        return *sharedResult;
+    if (waiterState->result) {
+        return *waiterState->result;
     }
     return std::vector<BSONObj>();
 }
@@ -344,11 +365,13 @@ void ConfigQueryCoalescer::shutdown() {
     stdx::lock_guard<stdx::mutex> lock(_mutex);
     _shutdown = true;
 
+    // 通过 shared_ptr 安全地通知所有等待者
+    // 即使调用者已经返回，shared_ptr 保证内存有效
     for (auto& pair : _groups) {
         for (auto& waiter : pair.second->waiters) {
-            *waiter.statusPtr = Status(ErrorCodes::ShutdownInProgress,
-                                       "ConfigQueryCoalescer is shutting down");
-            waiter.donePtr->store(true, std::memory_order_release);
+            waiter.state->status = Status(ErrorCodes::ShutdownInProgress,
+                                          "ConfigQueryCoalescer is shutting down");
+            waiter.state->done.store(true, std::memory_order_release);
         }
     }
 
