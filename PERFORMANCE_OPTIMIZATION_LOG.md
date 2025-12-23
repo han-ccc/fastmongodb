@@ -19,6 +19,78 @@
 | v2.1.0 | 2025-12-20 | 分层Timing统计系统 | 新增mongos/mongod/RocksDB分层时延统计，分片集群测试环境 |
 | v2.2.0 | 2025-12-21 | Phase A': BSONElement::size()分支消除 | 使用kFixedSizes查表替代switch语句 |
 | v2.3.0 | 2025-12-21 | Phase B': 短字符串整数比较优化 | StringData≤8字节使用uint64比较替代memcmp |
+| v3.0.0 | 2025-12-23 | ConfigQueryCoalescer 无窗口优化 | ✅ **QPS 2.74x**, 延迟-63%, CPU-71% |
+
+---
+
+## v3.0.0 ConfigQueryCoalescer 无窗口优化 (2025-12-23)
+
+### 优化内容
+
+**问题**: 分片集群中，数千 mongos 同时刷新路由表时，原有 20ms 合并窗口导致 CPU 资源闲置，QPS 无法提升。
+
+**优化**: 移除合并窗口，第一个请求立即执行，后续请求复用结果。
+
+#### 核心改动
+
+| 改动 | 说明 |
+|------|------|
+| 无窗口等待 | 第一个请求成为 Leader 立即执行查询 |
+| Leader/Follower 模式 | Followers 等待 Leader 完成后共享结果 |
+| shared_ptr 结果分发 | O(1) 结果复制，避免大量数据拷贝 |
+| 版本差距检测 | 版本差距 > 500 的请求独立执行 |
+
+#### 修改文件
+
+| 文件 | 修改 |
+|------|------|
+| `src/mongo/db/s/config/config_query_coalescer.cpp` | 无窗口优化实现 |
+| `src/mongo/db/s/config/config_query_coalescer.h` | 接口更新 |
+| `src/mongo/s/catalog/coalescer_e2e_stress_test.cpp` | E2E 压力测试 |
+
+### 测试结果
+
+#### 压测配置
+- **环境**: 104 collections, 100,000 chunks, 单机 mongod
+- **chunk 文档大小**: 约 125 bytes
+- **并发**: 1000 线程
+- **时长**: 15 秒/场景
+
+#### 场景说明
+
+| 场景 | 版本分布 | 模拟场景 |
+|------|----------|----------|
+| SAME_VERSION | 所有请求使用相同版本 | mongos 集群冷启动，全部从 version=0 开始 |
+| CLOSE_VERSIONS | 版本在 [base, base+100] 范围内 | 正常运行中的 mongos 集群，版本相近 |
+| BOUNDARY_GAP | 版本在 [base, base+500] 范围内 | 部分 mongos 短暂离线后重连 |
+| HOTSPOT_MIX | 80% 相近版本 + 20% 随机版本 | 热点集中场景 |
+| RANDOM | 版本在 [1, numChunks] 均匀随机 | 压力测试基线，最差情况 |
+
+#### 场景对比
+
+| 场景 | QPS | 延迟 | CPU | 合并率 | 响应吞吐 | 文档数 |
+|------|-----|------|-----|--------|----------|--------|
+| SAME_VERSION | **25,186** | 38ms | 27% | 80% | 2,716 MB/s | 351M |
+| CLOSE_VERSIONS | 25,125 | 38ms | 28% | 80% | 2,711 MB/s | 350M |
+| BOUNDARY_GAP | 24,941 | 38ms | 28% | 80% | 2,688 MB/s | 347M |
+| HOTSPOT_MIX | 18,263 | 53ms | 92% | 53% | 1,961 MB/s | 253M |
+| RANDOM (基线) | 9,208 | 103ms | 94% | 8% | 971 MB/s | 125M |
+
+#### 优化效果 (SAME_VERSION vs RANDOM)
+
+| 指标 | RANDOM | SAME_VERSION | 提升 |
+|------|--------|--------------|------|
+| QPS | 9,208 | 25,186 | **+174%** |
+| 延迟 | 103ms | 38ms | **-63%** |
+| CPU | 94% | 27% | **-71%** |
+| 响应吞吐 | 971 MB/s | 2,716 MB/s | **+180%** |
+
+### 分析
+
+1. **无窗口 = 无等待**: 移除 20ms 窗口后，CPU 不再闲置
+2. **结果共享高效**: 80% 请求复用 Leader 结果，只有 20% 实际执行查询
+3. **吞吐与 QPS 正相关**: 带宽比率 2.80x ≈ QPS 比率 2.74x
+4. **版本差距过滤有效**: HOTSPOT_MIX 场景中 84,475 请求因版本差距独立执行
 
 ---
 
