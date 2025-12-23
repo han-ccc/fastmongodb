@@ -54,18 +54,9 @@ const BSONElement nullElt = nullObj.firstElement();
 const BSONObj undefinedObj = BSON("" << BSONUndefined);
 const BSONElement undefinedElt = undefinedObj.firstElement();
 
-// 阶段4v3: 线程局部字段偏移量缓存
+// 阶段4v3: 字段偏移量缓存
 // 用于跨索引共享已提取的字段，避免重复遍历文档
-struct FieldOffsetCache {
-    const char* docPtr = nullptr;  // 当前缓存的文档指针
-    uint32_t offsets[256];         // 槽位 -> 字段在文档中的偏移量 (0=未缓存)
-
-    void reset(const char* newDocPtr) {
-        docPtr = newDocPtr;
-        std::memset(offsets, 0, sizeof(offsets));
-    }
-};
-thread_local FieldOffsetCache g_fieldCache;
+// 注意：FieldOffsetCache 定义在 btree_key_generator.h 中
 
 // 计算字段名的缓存槽位（构造时调用一次，运行时零开销）
 inline uint8_t computeCacheSlot(const char* name, size_t len) {
@@ -108,10 +99,15 @@ std::unique_ptr<BtreeKeyGenerator> BtreeKeyGenerator::make(IndexVersion indexVer
 
 void BtreeKeyGenerator::getKeys(const BSONObj& obj,
                                 BSONObjSet* keys,
-                                MultikeyPaths* multikeyPaths) const {
+                                MultikeyPaths* multikeyPaths,
+                                FieldOffsetCache* cache) const {
+    // 如果调用者没有提供缓存，创建一个临时的
+    FieldOffsetCache localCache;
+    FieldOffsetCache* cacheToUse = cache ? cache : &localCache;
+
     // '_fieldNames' and '_fixed' are passed by value so that they can be mutated as part of the
     // getKeys call.  :|
-    getKeysImpl(_fieldNames, _fixed, obj, keys, multikeyPaths);
+    getKeysImpl(_fieldNames, _fixed, obj, keys, multikeyPaths, cacheToUse);
     if (keys->empty() && !_isSparse) {
         keys->insert(_nullKey);
     }
@@ -132,7 +128,10 @@ void BtreeKeyGeneratorV0::getKeysImpl(std::vector<const char*> fieldNames,
                                       std::vector<BSONElement> fixed,
                                       const BSONObj& obj,
                                       BSONObjSet* keys,
-                                      MultikeyPaths* multikeyPaths) const {
+                                      MultikeyPaths* multikeyPaths,
+                                      FieldOffsetCache* cache) const {
+    // V0 版本不使用缓存优化
+    (void)cache;
     if (_isIdIndex) {
         // we special case for speed
         BSONElement e = obj["_id"];
@@ -232,7 +231,7 @@ void BtreeKeyGeneratorV0::getKeysImpl(std::vector<const char*> fieldNames,
             while (i.more()) {
                 BSONElement e = i.next();
                 if (e.type() == Object) {
-                    getKeysImpl(fieldNames, fixed, e.embeddedObject(), keys, multikeyPaths);
+                    getKeysImpl(fieldNames, fixed, e.embeddedObject(), keys, multikeyPaths, cache);
                 }
             }
         } else {
@@ -367,7 +366,8 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
                                       std::vector<BSONElement> fixed,
                                       const BSONObj& obj,
                                       BSONObjSet* keys,
-                                      MultikeyPaths* multikeyPaths) const {
+                                      MultikeyPaths* multikeyPaths,
+                                      FieldOffsetCache* cache) const {
     if (_isIdIndex) {
         // we special case for speed
         BSONElement e = obj["_id"];
@@ -396,13 +396,14 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
     }
 
     // === 阶段4v3: 增量偏移量缓存 ===
-    // 检查缓存是否针对当前文档有效
+    // 检查缓存是否针对当前文档有效（使用指针+大小双重校验）
     const char* objData = obj.objdata();
-    bool cacheValid = (g_fieldCache.docPtr == objData);
+    const uint32_t objSize = obj.objsize();
+    bool cacheValid = cache->isValidFor(objData, objSize);
 
     if (!cacheValid) {
         // 新文档，重置缓存
-        g_fieldCache.reset(objData);
+        cache->init(objData, objSize);
     }
 
     // 阶段4v3: 先尝试从缓存获取字段（仅对后续索引有效）
@@ -414,7 +415,7 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
                 continue;
             }
 
-            uint32_t offset = g_fieldCache.offsets[info.cacheSlot];
+            uint32_t offset = cache->offsets[info.cacheSlot];
             if (offset != 0) {
                 // 缓存命中：从偏移量重建BSONElement
                 BSONElement cached(objData + offset);
@@ -472,7 +473,7 @@ void BtreeKeyGeneratorV1::getKeysImpl(std::vector<const char*> fieldNames,
                         foundCount++;
 
                         // 阶段4v3: 顺便填充缓存，供后续索引使用
-                        g_fieldCache.offsets[info.cacheSlot] =
+                        cache->offsets[info.cacheSlot] =
                             e.rawdata() - objData;
                     }
                     break;  // 一个文档字段最多匹配一个索引字段

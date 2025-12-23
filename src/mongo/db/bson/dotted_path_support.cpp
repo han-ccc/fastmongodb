@@ -32,7 +32,6 @@
 
 #include <cctype>
 #include <string>
-#include <unordered_map>
 
 #include "mongo/bson/bsonelement.h"
 #include "mongo/bson/bsonmisc.h"
@@ -47,33 +46,9 @@ namespace {
 const BSONObj kNullObj = BSON("" << BSONNULL);
 const BSONElement kNullElt = kNullObj.firstElement();
 
-/**
- * P1优化: 字段提取缓存
- *
- * 问题: 插入N个索引的文档时，同一字段会被提取N次
- * 方案: 缓存字段提取结果，同一文档的重复提取直接返回缓存
- */
-struct FieldExtractionCache {
-    const char* docData = nullptr;
-
-    struct CacheEntry {
-        BSONElement element;
-        size_t pathConsumed;  // path被消费的长度
-    };
-    std::unordered_map<std::string, CacheEntry> cache;
-
-    void checkDocument(const char* newDocData) {
-        if (docData != newDocData) {
-            docData = newDocData;
-            cache.clear();
-        }
-    }
-
-    static FieldExtractionCache& instance() {
-        thread_local FieldExtractionCache inst;
-        return inst;
-    }
-};
+// 注意：原来这里有 FieldExtractionCache，但它在处理数组时有 bug
+// （缓存不同对象的相同路径会冲突，导致返回错误的 BSONElement）
+// 已移除，改用 btree_key_generator.cpp 中的请求级 FieldOffsetCache
 
 template <typename BSONElementColl>
 void _extractAllElementsAlongPath(const BSONObj& obj,
@@ -195,36 +170,10 @@ BSONElement _extractElementAtPathOrArrayAlongPathImpl(const BSONObj& obj, const 
 }
 
 BSONElement extractElementAtPathOrArrayAlongPath(const BSONObj& obj, const char*& path) {
-    // P1优化: 使用字段提取缓存（仅对嵌套路径有效）
-    // 对于顶层字段，缓存开销可能大于收益，直接执行
-
-    // 快速路径：检查是否为顶层字段（无嵌套）
-    const char* dot = strchr(path, '.');
-    if (!dot) {
-        // 顶层字段：直接提取，不使用缓存
-        BSONElement sub = obj.getField(path);
-        path = path + strlen(path);
-        return sub;
-    }
-
-    // 嵌套路径：使用缓存
-    auto& cache = FieldExtractionCache::instance();
-    cache.checkDocument(obj.objdata());
-
-    const char* originalPath = path;
-    std::string pathKey(originalPath);
-
-    auto it = cache.cache.find(pathKey);
-    if (it != cache.cache.end()) {
-        path = originalPath + it->second.pathConsumed;
-        return it->second.element;
-    }
-
-    BSONElement result = _extractElementAtPathOrArrayAlongPathImpl(obj, path);
-    size_t consumed = path - originalPath;
-    cache.cache[pathKey] = {result, consumed};
-
-    return result;
+    // 直接调用实现函数，不使用缓存
+    // 注意：原来的 thread_local 缓存在处理数组时有 bug（缓存不同对象的相同路径会冲突）
+    // btree_key_generator.cpp 中已有请求级 FieldOffsetCache，这里不需要额外缓存
+    return _extractElementAtPathOrArrayAlongPathImpl(obj, path);
 }
 
 void extractAllElementsAlongPath(const BSONObj& obj,
