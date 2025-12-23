@@ -586,8 +586,12 @@ int BSONElement::size() const {
     // kFixedSizes[t] > 0 表示固定大小, 0 表示需要特殊处理
     if (t < 32 && kFixedSizes[t] != 0) {
         x = kFixedSizes[t];
+    } else if (static_cast<unsigned>(t) >= 32) {
+        // 无效类型（损坏的BSON或未知类型），按零大小处理
+        // 注意：MaxKey=127, MinKey=-1 会走到这里，但它们确实没有值部分
+        x = 0;
     } else {
-        // 变长类型使用位掩码分组判断
+        // 变长类型使用位掩码分组判断（此时保证 t < 32，位移安全）
         // String/Code/Symbol: 4字节长度 + 字符串内容
         constexpr uint32_t kStringSizeMask =
             (1u << mongo::String) | (1u << Code) | (1u << Symbol);
@@ -611,7 +615,7 @@ int BSONElement::size() const {
             size_t len2 = strlen(p);
             x = (int)(len1 + 1 + len2 + 1);
         } else {
-            // EOO, Undefined, Null, MaxKey, MinKey: 无值部分
+            // EOO, Undefined, Null: 无值部分
             x = 0;
         }
     }

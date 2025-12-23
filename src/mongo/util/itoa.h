@@ -137,8 +137,9 @@ public:
     }
 
 private:
-    // 足够存储uint32_t最大值 (4294967295 = 10位)
-    static constexpr std::size_t kBufSize = 11;
+    // 支持uint64_t最大值 (18446744073709551615 = 20位) + 终止符
+    // 虽然当前主要用于uint32_t，但防止递增溢出
+    static constexpr std::size_t kBufSize = 21;
     char _buf[kBufSize];
     char* _end;
 };
