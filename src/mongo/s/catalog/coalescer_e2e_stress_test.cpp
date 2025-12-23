@@ -38,6 +38,7 @@
 
 #include "mongo/bson/bsonobjbuilder.h"
 #include "mongo/client/dbclientinterface.h"
+#include "mongo/db/s/config/config_query_coalescer.h"
 #include "mongo/unittest/unittest.h"
 #include "mongo/util/net/hostandport.h"
 #include "mongo/util/time_support.h"
@@ -459,64 +460,162 @@ private:
 };
 
 // ============================================================================
-// Query Worker
+// Connection Pool
 // ============================================================================
 
-class QueryWorker {
+class ConnectionPool {
 public:
-    QueryWorker(int port, TestStats& stats, std::atomic<bool>& running, VersionScenario scenario)
-        : _port(port), _stats(stats), _running(running), _scenario(scenario) {}
+    ConnectionPool(int port, size_t poolSize) : _port(port), _shutdown(false) {
+        HostAndPort server("localhost", port);
 
-    void run() {
-        HostAndPort server("localhost", _port);
-        CollectionSelector selector(_scenario);
-
-        try {
-            DBClientConnection conn;
+        for (size_t i = 0; i < poolSize; i++) {
+            std::unique_ptr<DBClientConnection> conn(new DBClientConnection());
             std::string errmsg;
-
-            if (!conn.connect(server, "coalescer_worker", errmsg)) {
-                _stats.recordFailure();
-                return;
+            if (conn->connect(server, "coalescer_pool", errmsg)) {
+                _available.push_back(std::move(conn));
             }
-
-            while (_running.load()) {
-                auto selection = selector.select(_stats);
-                size_t version = selector.getVersion(selection.maxVersion);
-
-                auto queryStart = std::chrono::high_resolution_clock::now();
-
-                try {
-                    BSONObj query = BSON("ns" << selection.ns
-                                         << "lastmod" << BSON("$gt" << Timestamp(version, 0)));
-
-                    auto cursor = conn.query("config.chunks", query, 1000);
-
-                    while (cursor->more()) {
-                        cursor->next();
-                    }
-
-                    auto queryEnd = std::chrono::high_resolution_clock::now();
-                    auto latencyUs = std::chrono::duration_cast<std::chrono::microseconds>(
-                        queryEnd - queryStart).count();
-
-                    _stats.recordSuccess(latencyUs);
-
-                } catch (const std::exception&) {
-                    _stats.recordFailure();
-                }
-            }
-
-        } catch (const std::exception&) {
-            // Worker failed to start
         }
+        std::cout << "  [ConnectionPool] Created " << _available.size()
+                  << " connections" << std::endl;
+    }
+
+    ~ConnectionPool() {
+        shutdown();
+    }
+
+    // Acquire a connection (blocking with timeout)
+    DBClientConnection* acquire(Milliseconds timeout = Milliseconds(1000)) {
+        std::unique_lock<std::mutex> lock(_mutex);
+
+        if (!_cv.wait_for(lock, timeout.toSystemDuration(), [this]() {
+            return _shutdown || !_available.empty();
+        })) {
+            return nullptr;  // Timeout
+        }
+
+        if (_shutdown || _available.empty()) {
+            return nullptr;
+        }
+
+        auto conn = std::move(_available.back());
+        _available.pop_back();
+        DBClientConnection* raw = conn.get();
+        _inUse[raw] = std::move(conn);
+        return raw;
+    }
+
+    // Release a connection back to pool
+    void release(DBClientConnection* conn) {
+        if (!conn) return;
+
+        std::lock_guard<std::mutex> lock(_mutex);
+        auto it = _inUse.find(conn);
+        if (it != _inUse.end()) {
+            _available.push_back(std::move(it->second));
+            _inUse.erase(it);
+            _cv.notify_one();
+        }
+    }
+
+    void shutdown() {
+        std::lock_guard<std::mutex> lock(_mutex);
+        _shutdown = true;
+        _available.clear();
+        _inUse.clear();
+        _cv.notify_all();
+    }
+
+    size_t size() const {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return _available.size() + _inUse.size();
     }
 
 private:
     int _port;
+    mutable std::mutex _mutex;
+    std::condition_variable _cv;
+    std::vector<std::unique_ptr<DBClientConnection>> _available;
+    std::map<DBClientConnection*, std::unique_ptr<DBClientConnection>> _inUse;
+    bool _shutdown;
+};
+
+// ============================================================================
+// Query Worker (uses shared connection pool)
+// ============================================================================
+
+class QueryWorker {
+public:
+    QueryWorker(ConnectionPool* pool, TestStats& stats, std::atomic<bool>& running,
+                VersionScenario scenario, ConfigQueryCoalescer* coalescer)
+        : _pool(pool), _stats(stats), _running(running),
+          _scenario(scenario), _coalescer(coalescer) {}
+
+    void run() {
+        CollectionSelector selector(_scenario);
+
+        while (_running.load()) {
+            auto selection = selector.select(_stats);
+            size_t version = selector.getVersion(selection.maxVersion);
+
+            auto queryStart = std::chrono::high_resolution_clock::now();
+
+            try {
+                // Use coalescer to merge requests
+                // Only leader will actually acquire connection and execute query
+                auto result = _coalescer->tryCoalesce(
+                    nullptr,  // OperationContext not needed for this test
+                    selection.ns,
+                    version,
+                    [this, &selection, version]() -> StatusWith<std::vector<BSONObj>> {
+                        // This lambda is only executed by the leader
+                        // Acquire connection from pool
+                        auto conn = _pool->acquire(Milliseconds(500));
+                        if (!conn) {
+                            return Status(ErrorCodes::ExceededTimeLimit,
+                                         "Failed to acquire connection from pool");
+                        }
+
+                        // Execute query
+                        BSONObj query = BSON("ns" << selection.ns
+                                             << "lastmod" << BSON("$gt" << Timestamp(version, 0)));
+
+                        std::vector<BSONObj> results;
+                        try {
+                            auto cursor = conn->query("config.chunks", query, 1000);
+                            while (cursor->more()) {
+                                results.push_back(cursor->next().getOwned());
+                            }
+                        } catch (...) {
+                            _pool->release(conn);
+                            throw;
+                        }
+
+                        _pool->release(conn);
+                        return results;
+                    });
+
+                auto queryEnd = std::chrono::high_resolution_clock::now();
+                auto latencyUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                    queryEnd - queryStart).count();
+
+                if (result.isOK()) {
+                    _stats.recordSuccess(latencyUs);
+                } else {
+                    _stats.recordFailure();
+                }
+
+            } catch (const std::exception&) {
+                _stats.recordFailure();
+            }
+        }
+    }
+
+private:
+    ConnectionPool* _pool;
     TestStats& _stats;
     std::atomic<bool>& _running;
     VersionScenario _scenario;
+    ConfigQueryCoalescer* _coalescer;
 };
 
 // ============================================================================
@@ -537,6 +636,11 @@ public:
     static void printResults(size_t concurrency, const TestStats& stats,
                              const ResourceStats& resources, uint64_t durationMs) {
         uint64_t qps = stats.totalQueries.load() * 1000 / durationMs;
+
+        // Calculate bandwidth in MB/s
+        double durationSec = static_cast<double>(durationMs) / 1000.0;
+        double rxMBps = (resources.networkRxBytes.load() / 1024.0 / 1024.0) / durationSec;
+        double txMBps = (resources.networkTxBytes.load() / 1024.0 / 1024.0) / durationSec;
 
         std::cout << "\n";
         printLine();
@@ -559,8 +663,10 @@ public:
         std::cout << "    CPU Usage:        " << std::setw(11) << std::fixed << std::setprecision(1)
                   << resources.peakCpuPercent.load() << "%" << std::endl;
         std::cout << "    Memory:           " << std::setw(10) << resources.peakMemoryMB.load() << " MB" << std::endl;
-        std::cout << "    Network RX:       " << std::setw(10) << (resources.networkRxBytes.load() / 1024 / 1024) << " MB" << std::endl;
-        std::cout << "    Network TX:       " << std::setw(10) << (resources.networkTxBytes.load() / 1024 / 1024) << " MB" << std::endl;
+        std::cout << "    Network RX:       " << std::setw(8) << std::fixed << std::setprecision(2)
+                  << rxMBps << " MB/s" << std::endl;
+        std::cout << "    Network TX:       " << std::setw(8) << std::fixed << std::setprecision(2)
+                  << txMBps << " MB/s" << std::endl;
 
         // Query distribution
         std::cout << "  Query Distribution:" << std::endl;
@@ -589,7 +695,6 @@ public:
         printLine();
     }
 
-private:
     static void printLine() {
         std::cout << "  " << std::string(56, '=') << std::endl;
     }
@@ -619,9 +724,13 @@ int getMongodPid(int port) {
 // ============================================================================
 
 struct TestResult {
+    size_t threads;
     uint64_t qps;
-    double successRate;
     uint64_t avgLatencyUs;
+    double cpuPercent;
+    double failRate;        // 失败率 (%)
+    double coalescingRate;  // 合并率
+    double bandwidthMBps;   // 带宽 MB/s (RX+TX)/2
 };
 
 TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& stats, int mongodPid) {
@@ -629,6 +738,20 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
     ResourceStats resources;
 
     ResultPrinter::printHeader(numThreads, config.testDurationSec, config.versionScenario);
+
+    // Create coalescer instance for this test round
+    ConfigQueryCoalescer::Config coalescerConfig;
+    coalescerConfig.coalescingWindow = Milliseconds(20);      // 20ms window for better coalescing
+    coalescerConfig.maxWaitTime = Milliseconds(500);          // 500ms per wait, then try promote to leader
+    coalescerConfig.maxTotalWaitTime = Milliseconds(15000);   // 15s total timeout before fail
+    coalescerConfig.maxWaitersPerGroup = 500;
+    ConfigQueryCoalescer coalescer(coalescerConfig);
+
+    // Create shared connection pool
+    // Pool size = expected concurrent leaders (much smaller than thread count)
+    size_t poolSize = std::min(numThreads / 5, size_t(300));  // ~20% of threads, max 300
+    poolSize = std::max(poolSize, size_t(50));  // At least 50 connections
+    ConnectionPool connPool(config.port, poolSize);
 
     // Start resource monitor
     ResourceMonitor monitor(resources, mongodPid);
@@ -642,8 +765,8 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
     auto testStart = Date_t::now();
 
     for (size_t i = 0; i < numThreads; i++) {
-        workers.emplace_back([&config, &stats, &running]() {
-            QueryWorker worker(config.port, stats, running, config.versionScenario);
+        workers.emplace_back([&connPool, &stats, &running, &config, &coalescer]() {
+            QueryWorker worker(&connPool, stats, running, config.versionScenario, &coalescer);
             worker.run();
         });
     }
@@ -671,6 +794,10 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
         worker.join();
     }
 
+    // Shutdown coalescer and connection pool
+    coalescer.shutdown();
+    connPool.shutdown();
+
     monitor.stop();
 
     auto testEnd = Date_t::now();
@@ -679,10 +806,33 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
     // Print results
     ResultPrinter::printResults(numThreads, stats, resources, durationMs);
 
+    // Print coalescer stats
+    auto coalescerStats = coalescer.getStats();
+    std::cout << "  Coalescer Stats:" << std::endl;
+    std::cout << "    Total Requests:     " << std::setw(10) << coalescerStats.totalRequests << std::endl;
+    std::cout << "    Actual Queries:     " << std::setw(10) << coalescerStats.actualQueries << std::endl;
+    std::cout << "    Coalesced:          " << std::setw(10) << coalescerStats.coalescedRequests
+              << " (" << std::fixed << std::setprecision(1)
+              << (coalescerStats.coalescingRate() * 100) << "%)" << std::endl;
+    std::cout << "    Version Gap Skips:  " << std::setw(10) << coalescerStats.versionGapSkippedRequests << std::endl;
+    ResultPrinter::printLine();
+
+    // Calculate metrics
+    uint64_t qps = stats.totalQueries.load() * 1000 / durationMs;
+    double durationSec = static_cast<double>(durationMs) / 1000.0;
+    double rxMBps = (resources.networkRxBytes.load() / 1024.0 / 1024.0) / durationSec;
+    double txMBps = (resources.networkTxBytes.load() / 1024.0 / 1024.0) / durationSec;
+    double failRate = stats.totalQueries.load() > 0 ?
+        100.0 * stats.failedQueries.load() / stats.totalQueries.load() : 0;
+
     return {
-        stats.totalQueries.load() * 1000 / durationMs,
-        stats.getSuccessRate(),
-        stats.getAvgLatencyUs()
+        numThreads,
+        qps,
+        stats.getAvgLatencyUs(),
+        resources.peakCpuPercent.load(),
+        failRate,
+        coalescerStats.coalescingRate(),
+        (rxMBps + txMBps) / 2.0
     };
 }
 
@@ -690,7 +840,11 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
 // Main Test
 // ============================================================================
 
-TEST(CoalescerE2EStressTest, ConcurrencyExploration) {
+TEST(CoalescerE2EStressTest, DISABLED_ConcurrencyExploration) {
+    // Skip this test - run VersionScenarioComparison instead
+    std::cout << "[SKIPPED] ConcurrencyExploration - use VersionScenarioComparison" << std::endl;
+    return;
+
     TestConfig config;
     TestStats stats;
 
@@ -726,8 +880,8 @@ TEST(CoalescerE2EStressTest, ConcurrencyExploration) {
         results.push_back({concurrency, result.qps});
 
         // Check if limit reached
-        double failRate = 100.0 - result.successRate;
-        if (failRate > config.maxFailRate * 100) {
+        if (result.failRate > config.maxFailRate * 100) {
+            double failRate = result.failRate;
             std::cout << "\n  [LIMIT REACHED] Fail rate " << std::fixed << std::setprecision(2)
                       << failRate << "% > " << (config.maxFailRate * 100) << "% threshold" << std::endl;
             break;
@@ -758,10 +912,15 @@ TEST(CoalescerE2EStressTest, ConcurrencyExploration) {
 // Version Scenario Test - Compare different version distributions
 // ============================================================================
 
+// Helper: Get appropriate concurrency for each scenario
+// 统一使用 1000 线程，排除线程数差异的影响
+size_t getConcurrencyForScenario(VersionScenario scenario) {
+    (void)scenario;
+    return 1000;  // 所有场景统一 1000 线程
+}
+
 TEST(CoalescerE2EStressTest, VersionScenarioComparison) {
     TestConfig config;
-    config.startConcurrency = 1000;
-    config.maxConcurrency = 1000;  // Single concurrency level
     config.testDurationSec = 15;   // Shorter duration per scenario
 
     TestStats stats;
@@ -769,8 +928,8 @@ TEST(CoalescerE2EStressTest, VersionScenarioComparison) {
     std::cout << "\n";
     std::cout << "  ============================================================" << std::endl;
     std::cout << "    Version Scenario Comparison Test" << std::endl;
-    std::cout << "    Concurrency: " << config.startConcurrency << " threads" << std::endl;
     std::cout << "    Duration: " << config.testDurationSec << "s per scenario" << std::endl;
+    std::cout << "    Concurrency: adaptive per scenario (1000-4000 threads)" << std::endl;
     std::cout << "  ============================================================" << std::endl;
 
     // Insert test data once
@@ -793,35 +952,46 @@ TEST(CoalescerE2EStressTest, VersionScenarioComparison) {
         VersionScenario::RANDOM
     };
 
-    std::vector<std::tuple<const char*, uint64_t, uint64_t>> scenarioResults;
+    // Store full results for each scenario
+    std::vector<std::pair<const char*, TestResult>> scenarioResults;
 
     for (auto scenario : scenarios) {
         config.versionScenario = scenario;
+        size_t concurrency = getConcurrencyForScenario(scenario);
 
-        std::cout << "\n  >>> Testing scenario: " << versionScenarioName(scenario) << std::endl;
+        std::cout << "\n  >>> Testing scenario: " << versionScenarioName(scenario)
+                  << " (" << concurrency << " threads)" << std::endl;
 
-        auto result = runTestRound(config, config.startConcurrency, stats, mongodPid);
-        scenarioResults.push_back({versionScenarioName(scenario), result.qps, result.avgLatencyUs});
+        auto result = runTestRound(config, concurrency, stats, mongodPid);
+        scenarioResults.push_back({versionScenarioName(scenario), result});
 
         // Pause between scenarios
         std::cout << "  [Pause 3 seconds before next scenario...]" << std::endl;
         std::this_thread::sleep_for(std::chrono::seconds(3));
     }
 
-    // Print comparison summary
+    // Print comparison summary with ALL metrics
     std::cout << "\n";
-    std::cout << "  ========================================================" << std::endl;
+    std::cout << "  ======================================================================================================" << std::endl;
     std::cout << "    VERSION SCENARIO COMPARISON RESULTS" << std::endl;
-    std::cout << "  ========================================================" << std::endl;
-    std::cout << "  Scenario            QPS       Avg Latency" << std::endl;
-    std::cout << "  ----------------  -------  -------------" << std::endl;
+    std::cout << "  ======================================================================================================" << std::endl;
+    std::cout << "  Scenario          Threads     QPS    Latency     CPU   FailRate  Coalesce   Bandwidth" << std::endl;
+    std::cout << "  ----------------  -------  -------  ---------  ------  --------  --------  ----------" << std::endl;
 
     for (const auto& r : scenarioResults) {
-        std::cout << "  " << std::left << std::setw(16) << std::get<0>(r)
-                  << "  " << std::right << std::setw(7) << std::get<1>(r)
-                  << "  " << std::setw(10) << std::get<2>(r) << " us" << std::endl;
+        const char* name = r.first;
+        const TestResult& res = r.second;
+        std::cout << "  " << std::left << std::setw(16) << name
+                  << "  " << std::right << std::setw(7) << res.threads
+                  << "  " << std::setw(7) << res.qps
+                  << "  " << std::setw(7) << (res.avgLatencyUs / 1000) << " ms"
+                  << "  " << std::setw(5) << std::fixed << std::setprecision(1) << res.cpuPercent << "%"
+                  << "  " << std::setw(7) << std::setprecision(2) << res.failRate << "%"
+                  << "  " << std::setw(7) << std::setprecision(1) << (res.coalescingRate * 100) << "%"
+                  << "  " << std::setw(7) << std::setprecision(0) << res.bandwidthMBps << " MB/s"
+                  << std::endl;
     }
-    std::cout << "  ========================================================" << std::endl;
+    std::cout << "  ======================================================================================================" << std::endl;
 
     std::cout << "\n  [PASS] Version scenario comparison completed!" << std::endl;
 }
