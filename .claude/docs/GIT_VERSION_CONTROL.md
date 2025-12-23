@@ -131,15 +131,75 @@ python /tmp/crud_benchmark_v3.py
 # 记录到 PERFORMANCE_OPTIMIZATION_LOG.md
 ```
 
-## 提交信息格式
+## 提交信息格式 (Conventional Commits)
+
+### 基本格式
 
 ```
 <type>(<scope>): <简短描述>
 
 <详细描述>
 
-<影响范围和测试说明>
+<footer>
 ```
 
-**type类型**: `perf`, `feat`, `fix`, `test`, `docs`, `refactor`
-**scope范围**: `bson`, `index`, `storage`, `query`, `sharding`
+### Type 类型 (英文，必填)
+
+| Type | 说明 | 示例 |
+|------|------|------|
+| `feat` | 新功能 | 添加查询缓存 |
+| `fix` | Bug 修复 | 修复内存泄漏 |
+| `perf` | 性能优化 | 优化索引查找 |
+| `refactor` | 重构 | 重构字段提取逻辑 |
+| `test` | 测试 | 补充单元测试 |
+| `docs` | 文档 | 更新 README |
+| `chore` | 构建/工具 | 更新 SConscript |
+| `style` | 代码格式 | 修正缩进 |
+
+### Scope 范围 (英文，可选)
+
+`bson`, `index`, `storage`, `query`, `sharding`, `util`, `db`
+
+### 语言规范 (中英混用)
+
+**原则**: type/scope 用英文，描述用中文，术语变量保持英文
+
+```bash
+# ✅ 推荐
+fix(bson): 修复 BSONElement 类型检查越界问题
+perf(index): 优化 UnifiedFieldExtractor 签名计算
+test: 补充 DecimalCounter 溢出边界测试
+
+# ❌ 不推荐
+fix(bson): fix BSONElement type check out of bounds  # 全英文难读
+fix(bson): 修复BSON元素类型检查越界问题  # 术语也翻译了
+```
+
+### 完整示例
+
+```bash
+git commit -m "$(cat <<'EOF'
+fix(sharding): 修复 ConfigQueryCoalescer 参数断开问题
+
+问题:
+- ServerParameter 修改后 atomic 变量未同步
+- 缺少参数范围验证
+
+修复:
+- 自定义 ServerParameter 类直接更新 atomic 变量
+- 添加范围验证 (windowMS: 1-1000, maxWaitMS: 1-10000)
+
+影响文件:
+- config_query_coalescer.cpp
+EOF
+)"
+```
+
+### 标题行要求
+
+| 规则 | 说明 |
+|------|------|
+| 长度 | ≤ 50 字符 (中文约 25 字) |
+| 时态 | 使用祈使句 (修复/添加/优化) |
+| 结尾 | 不加句号 |
+| 大小写 | type 小写，描述首字母可大写 |
