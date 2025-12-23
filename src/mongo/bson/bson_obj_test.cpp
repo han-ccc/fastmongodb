@@ -608,4 +608,167 @@ TEST(BSONObj, ShareOwnershipWith) {
     ASSERT_BSONOBJ_EQ(obj, BSON("a" << 1));
 }
 
+// ============================================================================
+// BSONElement Tests - 覆盖 #7 修复 (类型位移 UB)
+// ============================================================================
+
+// Test: All valid BSON types should work correctly
+TEST(BSONElement, ValidTypesSize) {
+    // Test common types and their sizes
+    auto testElement = [](const BSONObj& obj) {
+        BSONElement e = obj.firstElement();
+        ASSERT_FALSE(e.eoo());
+        // size() should not crash or return garbage
+        int sz = e.size();
+        ASSERT_GT(sz, 0);
+    };
+
+    testElement(BSON("a" << 1.0));           // Double
+    testElement(BSON("a" << "hello"));       // String
+    testElement(BSON("a" << BSON("b" << 1))); // Object
+    testElement(BSON("a" << BSON_ARRAY(1 << 2))); // Array
+    testElement(BSON("a" << BSONBinData("x", 1, BinDataGeneral))); // BinData
+    testElement(BSON("a" << OID::gen()));    // ObjectId
+    testElement(BSON("a" << true));          // Bool
+    testElement(BSON("a" << Date_t::fromMillisSinceEpoch(12345))); // Date
+    testElement(BSON("a" << BSONNULL));      // Null
+    testElement(BSON("a" << BSONRegEx("pattern", "i"))); // Regex
+    testElement(BSON("a" << 42));            // Int32
+    testElement(BSON("a" << Timestamp(1, 2))); // Timestamp
+    testElement(BSON("a" << 123456789LL));   // Int64
+}
+
+// Test: EOO element handling
+TEST(BSONElement, EOOElement) {
+    BSONObj obj = BSON("a" << 1);
+    BSONElement eoo = obj["nonexistent"];
+
+    ASSERT_TRUE(eoo.eoo());
+    ASSERT_EQ(eoo.type(), EOO);
+    // EOO element has size 1 (just the type byte)
+    ASSERT_EQ(eoo.size(), 1);
+}
+
+// Test: MinKey and MaxKey (special types with type values outside normal range)
+TEST(BSONElement, MinMaxKey) {
+    BSONObj minObj = BSON("a" << MINKEY);
+    BSONObj maxObj = BSON("a" << MAXKEY);
+
+    BSONElement minElem = minObj.firstElement();
+    BSONElement maxElem = maxObj.firstElement();
+
+    ASSERT_EQ(minElem.type(), MinKey);  // MinKey = -1
+    ASSERT_EQ(maxElem.type(), MaxKey);  // MaxKey = 127
+
+    // size() should handle these special types correctly
+    // They have no value part, so size should be small (just header)
+    ASSERT_GT(minElem.size(), 0);
+    ASSERT_GT(maxElem.size(), 0);
+}
+
+// Test: Type enum boundary values
+TEST(BSONElement, TypeBoundaryValues) {
+    // Verify all defined types are less than 32 (for safe bit shifting)
+    ASSERT_LT(static_cast<int>(EOO), 32);
+    ASSERT_LT(static_cast<int>(NumberDouble), 32);
+    ASSERT_LT(static_cast<int>(String), 32);
+    ASSERT_LT(static_cast<int>(Object), 32);
+    ASSERT_LT(static_cast<int>(Array), 32);
+    ASSERT_LT(static_cast<int>(BinData), 32);
+    ASSERT_LT(static_cast<int>(Undefined), 32);
+    ASSERT_LT(static_cast<int>(jstOID), 32);
+    ASSERT_LT(static_cast<int>(Bool), 32);
+    ASSERT_LT(static_cast<int>(Date), 32);
+    ASSERT_LT(static_cast<int>(jstNULL), 32);
+    ASSERT_LT(static_cast<int>(RegEx), 32);
+    ASSERT_LT(static_cast<int>(DBRef), 32);
+    ASSERT_LT(static_cast<int>(Code), 32);
+    ASSERT_LT(static_cast<int>(Symbol), 32);
+    ASSERT_LT(static_cast<int>(CodeWScope), 32);
+    ASSERT_LT(static_cast<int>(NumberInt), 32);
+    ASSERT_LT(static_cast<int>(bsonTimestamp), 32);
+    ASSERT_LT(static_cast<int>(NumberLong), 32);
+    ASSERT_LT(static_cast<int>(NumberDecimal), 32);
+
+    // MinKey and MaxKey are outside [0, 31] range
+    ASSERT_EQ(static_cast<int>(MinKey), -1);
+    ASSERT_EQ(static_cast<int>(MaxKey), 127);
+}
+
+// Test: Field name access
+TEST(BSONElement, FieldName) {
+    BSONObj obj = BSON("myFieldName" << 42);
+    BSONElement e = obj.firstElement();
+
+    ASSERT_EQ(StringData(e.fieldName()), "myFieldName");
+    ASSERT_EQ(e.fieldNameSize(), 12);  // "myFieldName" + null terminator
+}
+
+// Test: Empty field name
+TEST(BSONElement, EmptyFieldName) {
+    BSONObj obj = BSON("" << 42);
+    BSONElement e = obj.firstElement();
+
+    ASSERT_EQ(StringData(e.fieldName()), "");
+    ASSERT_EQ(e.fieldNameSize(), 1);  // just null terminator
+}
+
+// Test: Long field name
+TEST(BSONElement, LongFieldName) {
+    std::string longName(100, 'x');
+    BSONObj obj = BSON(longName << 42);
+    BSONElement e = obj.firstElement();
+
+    ASSERT_EQ(StringData(e.fieldName()), longName);
+    ASSERT_EQ(e.fieldNameSize(), 101);  // 100 chars + null terminator
+}
+
+// Test: Value access for different types
+TEST(BSONElement, ValueAccess) {
+    ASSERT_EQ(BSON("a" << 42).firstElement().Int(), 42);
+    ASSERT_EQ(BSON("a" << 42LL).firstElement().Long(), 42LL);
+    ASSERT_EQ(BSON("a" << 3.14).firstElement().Double(), 3.14);
+    ASSERT_EQ(BSON("a" << true).firstElement().Bool(), true);
+    ASSERT_EQ(BSON("a" << "test").firstElement().String(), "test");
+}
+
+// Test: Type coercion safety
+TEST(BSONElement, TypeCoercionSafety) {
+    BSONObj obj = BSON("a" << 42);
+    BSONElement e = obj.firstElement();
+
+    ASSERT_EQ(e.type(), NumberInt);
+    ASSERT_TRUE(e.isNumber());
+    ASSERT_FALSE(e.isABSONObj());
+
+    // numberInt() should work for NumberInt type
+    ASSERT_EQ(e.numberInt(), 42);
+
+    // numberLong() should also work (type coercion)
+    ASSERT_EQ(e.numberLong(), 42LL);
+}
+
+// Test: Nested object element
+TEST(BSONElement, NestedObjectElement) {
+    BSONObj inner = BSON("x" << 1 << "y" << 2);
+    BSONObj outer = BSON("nested" << inner);
+
+    BSONElement e = outer.firstElement();
+    ASSERT_EQ(e.type(), Object);
+    ASSERT_TRUE(e.isABSONObj());
+    ASSERT_BSONOBJ_EQ(e.Obj(), inner);
+}
+
+// Test: Array element
+TEST(BSONElement, ArrayElement) {
+    BSONObj obj = BSON("arr" << BSON_ARRAY(1 << 2 << 3));
+    BSONElement e = obj.firstElement();
+
+    ASSERT_EQ(e.type(), Array);
+    ASSERT_TRUE(e.isABSONObj());
+
+    BSONObj arr = e.Obj();
+    ASSERT_EQ(arr.nFields(), 3);
+}
+
 }  // unnamed namespace
