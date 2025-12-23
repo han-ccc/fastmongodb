@@ -247,6 +247,10 @@ struct TestStats {
     std::atomic<uint64_t> totalLatencyUs{0};
     std::atomic<uint64_t> maxLatencyUs{0};
 
+    // Config response bandwidth (BSON bytes received)
+    std::atomic<uint64_t> totalResponseBytes{0};
+    std::atomic<uint64_t> totalDocsReceived{0};
+
     // Per-collection stats
     std::atomic<uint64_t> largeCollQueries{0};
     std::atomic<uint64_t> mediumCollQueries{0};
@@ -259,19 +263,23 @@ struct TestStats {
         failedQueries = 0;
         totalLatencyUs = 0;
         maxLatencyUs = 0;
+        totalResponseBytes = 0;
+        totalDocsReceived = 0;
         largeCollQueries = 0;
         mediumCollQueries = 0;
         smallCollQueries = 0;
         tinyCollQueries = 0;
     }
 
-    void recordSuccess(int64_t latencyUs) {
+    void recordSuccess(int64_t latencyUs, uint64_t responseBytes = 0, uint64_t docsCount = 0) {
         // Guard against negative latency (clock issues)
         if (latencyUs < 0) latencyUs = 0;
 
         totalQueries++;
         successQueries++;
         totalLatencyUs += static_cast<uint64_t>(latencyUs);
+        totalResponseBytes += responseBytes;
+        totalDocsReceived += docsCount;
 
         uint64_t latency = static_cast<uint64_t>(latencyUs);
         uint64_t current = maxLatencyUs.load();
@@ -599,7 +607,13 @@ public:
                     queryEnd - queryStart).count();
 
                 if (result.isOK()) {
-                    _stats.recordSuccess(latencyUs);
+                    // Calculate response size (BSON bytes from Config Server)
+                    uint64_t responseBytes = 0;
+                    uint64_t docsCount = result.getValue().size();
+                    for (const auto& doc : result.getValue()) {
+                        responseBytes += doc.objsize();
+                    }
+                    _stats.recordSuccess(latencyUs, responseBytes, docsCount);
                 } else {
                     _stats.recordFailure();
                 }
@@ -639,8 +653,11 @@ public:
 
         // Calculate bandwidth in MB/s
         double durationSec = static_cast<double>(durationMs) / 1000.0;
-        double rxMBps = (resources.networkRxBytes.load() / 1024.0 / 1024.0) / durationSec;
-        double txMBps = (resources.networkTxBytes.load() / 1024.0 / 1024.0) / durationSec;
+
+        // Config response bandwidth (BSON data received)
+        double configBandwidthMBps = (stats.totalResponseBytes.load() / 1024.0 / 1024.0) / durationSec;
+        uint64_t totalDocs = stats.totalDocsReceived.load();
+        uint64_t avgDocSize = totalDocs > 0 ? stats.totalResponseBytes.load() / totalDocs : 0;
 
         std::cout << "\n";
         printLine();
@@ -658,15 +675,19 @@ public:
         std::cout << "    Avg Latency:      " << std::setw(10) << stats.getAvgLatencyUs() << " us" << std::endl;
         std::cout << "    Max Latency:      " << std::setw(10) << stats.maxLatencyUs.load() << " us" << std::endl;
 
+        // Config response stats
+        std::cout << "  Config Response:" << std::endl;
+        std::cout << "    Total Docs:       " << std::setw(12) << totalDocs << std::endl;
+        std::cout << "    Total Bytes:      " << std::setw(10) << (stats.totalResponseBytes.load() / 1024 / 1024) << " MB" << std::endl;
+        std::cout << "    Avg Doc Size:     " << std::setw(10) << avgDocSize << " bytes" << std::endl;
+        std::cout << "    Bandwidth:        " << std::setw(8) << std::fixed << std::setprecision(2)
+                  << configBandwidthMBps << " MB/s" << std::endl;
+
         // Resource usage
         std::cout << "  Resources (Peak):" << std::endl;
         std::cout << "    CPU Usage:        " << std::setw(11) << std::fixed << std::setprecision(1)
                   << resources.peakCpuPercent.load() << "%" << std::endl;
         std::cout << "    Memory:           " << std::setw(10) << resources.peakMemoryMB.load() << " MB" << std::endl;
-        std::cout << "    Network RX:       " << std::setw(8) << std::fixed << std::setprecision(2)
-                  << rxMBps << " MB/s" << std::endl;
-        std::cout << "    Network TX:       " << std::setw(8) << std::fixed << std::setprecision(2)
-                  << txMBps << " MB/s" << std::endl;
 
         // Query distribution
         std::cout << "  Query Distribution:" << std::endl;
@@ -728,9 +749,10 @@ struct TestResult {
     uint64_t qps;
     uint64_t avgLatencyUs;
     double cpuPercent;
-    double failRate;        // 失败率 (%)
-    double coalescingRate;  // 合并率
-    double bandwidthMBps;   // 带宽 MB/s (RX+TX)/2
+    double failRate;           // 失败率 (%)
+    double coalescingRate;     // 合并率
+    double configBandwidthMBps; // Config 响应带宽 MB/s (BSON数据量)
+    uint64_t totalDocs;        // 返回的文档总数
 };
 
 TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& stats, int mongodPid) {
@@ -820,8 +842,7 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
     // Calculate metrics
     uint64_t qps = stats.totalQueries.load() * 1000 / durationMs;
     double durationSec = static_cast<double>(durationMs) / 1000.0;
-    double rxMBps = (resources.networkRxBytes.load() / 1024.0 / 1024.0) / durationSec;
-    double txMBps = (resources.networkTxBytes.load() / 1024.0 / 1024.0) / durationSec;
+    double configBandwidthMBps = (stats.totalResponseBytes.load() / 1024.0 / 1024.0) / durationSec;
     double failRate = stats.totalQueries.load() > 0 ?
         100.0 * stats.failedQueries.load() / stats.totalQueries.load() : 0;
 
@@ -832,7 +853,8 @@ TestResult runTestRound(const TestConfig& config, size_t numThreads, TestStats& 
         resources.peakCpuPercent.load(),
         failRate,
         coalescerStats.coalescingRate(),
-        (rxMBps + txMBps) / 2.0
+        configBandwidthMBps,
+        stats.totalDocsReceived.load()
     };
 }
 
@@ -972,11 +994,11 @@ TEST(CoalescerE2EStressTest, VersionScenarioComparison) {
 
     // Print comparison summary with ALL metrics
     std::cout << "\n";
-    std::cout << "  ======================================================================================================" << std::endl;
-    std::cout << "    VERSION SCENARIO COMPARISON RESULTS" << std::endl;
-    std::cout << "  ======================================================================================================" << std::endl;
-    std::cout << "  Scenario          Threads     QPS    Latency     CPU   FailRate  Coalesce   Bandwidth" << std::endl;
-    std::cout << "  ----------------  -------  -------  ---------  ------  --------  --------  ----------" << std::endl;
+    std::cout << "  ============================================================================================================" << std::endl;
+    std::cout << "    VERSION SCENARIO COMPARISON RESULTS (Config Response Bandwidth)" << std::endl;
+    std::cout << "  ============================================================================================================" << std::endl;
+    std::cout << "  Scenario          Threads     QPS    Latency     CPU   FailRate  Coalesce   Bandwidth     Docs" << std::endl;
+    std::cout << "  ----------------  -------  -------  ---------  ------  --------  --------  ----------  -------" << std::endl;
 
     for (const auto& r : scenarioResults) {
         const char* name = r.first;
@@ -988,10 +1010,11 @@ TEST(CoalescerE2EStressTest, VersionScenarioComparison) {
                   << "  " << std::setw(5) << std::fixed << std::setprecision(1) << res.cpuPercent << "%"
                   << "  " << std::setw(7) << std::setprecision(2) << res.failRate << "%"
                   << "  " << std::setw(7) << std::setprecision(1) << (res.coalescingRate * 100) << "%"
-                  << "  " << std::setw(7) << std::setprecision(0) << res.bandwidthMBps << " MB/s"
+                  << "  " << std::setw(7) << std::setprecision(1) << res.configBandwidthMBps << " MB/s"
+                  << "  " << std::setw(7) << (res.totalDocs / 1000000) << "M"
                   << std::endl;
     }
-    std::cout << "  ======================================================================================================" << std::endl;
+    std::cout << "  ============================================================================================================" << std::endl;
 
     std::cout << "\n  [PASS] Version scenario comparison completed!" << std::endl;
 }
