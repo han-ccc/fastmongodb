@@ -1,5 +1,7 @@
 /build
-/src/mongo/db/modules
+# Allow rocks module in repo (was: /src/mongo/db/modules)
+/src/mongo/db/modules/*
+!/src/mongo/db/modules/rocks
 /.jsdbshell
 /.dbshell
 /perf.data
