@@ -614,14 +614,9 @@ namespace mongo {
 
     std::string RocksIndexBase::_makePrefixedKey(const std::string& prefix,
                                                  const KeyString& encodedKey) {
-        // P2 Optimization: Reuse thread_local buffer to avoid repeated allocations
-        // Benchmark result: 58% improvement (12ns -> 5ns per operation)
-        thread_local std::string prefixedKeyBuffer;
-        prefixedKeyBuffer.clear();
-        prefixedKeyBuffer.reserve(256);  // Pre-allocate for typical key sizes
-        prefixedKeyBuffer.append(prefix);
-        prefixedKeyBuffer.append(encodedKey.getBuffer(), encodedKey.getSize());
-        return prefixedKeyBuffer;
+        std::string prefixedKey = prefix;
+        prefixedKey.append(encodedKey.getBuffer(), encodedKey.getSize());
+        return prefixedKey;
     }
 
     /// RocksUniqueIndex
