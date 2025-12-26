@@ -100,6 +100,9 @@ env.AddMethod(injectThirdPartyIncludePaths, 'InjectThirdPartyIncludePaths')
 murmurEnv = env.Clone()
 murmurEnv.SConscript('murmurhash3/SConscript', exports={ 'env' : murmurEnv })
 
+xxhashEnv = env.Clone()
+xxhashEnv.SConscript('xxhash/SConscript', exports={ 'env' : xxhashEnv })
+
 
 s2Env = env.Clone()
 s2Env.InjectThirdPartyIncludePaths(libraries=['s2', 'boost'])
