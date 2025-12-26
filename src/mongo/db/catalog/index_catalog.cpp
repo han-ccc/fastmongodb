@@ -43,6 +43,7 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/collection_catalog_entry.h"
 #include "mongo/db/catalog/database_catalog_entry.h"
+#include "mongo/db/catalog/document_integrity.h"
 #include "mongo/db/catalog/index_create.h"
 #include "mongo/db/catalog/index_key_validate.h"
 #include "mongo/db/client.h"
@@ -568,6 +569,19 @@ Status IndexCatalog::_isSpecOk(OperationContext* txn, const BSONObj& spec) const
         return Status(ErrorCodes::CannotCreateIndex,
                       str::stream() << "bad index key pattern " << key << ": "
                                     << keyStatus.reason());
+    }
+
+    // Forbid indexing on _$docHash - it's a reserved field that is stripped before storage
+    for (auto&& elem : key) {
+        StringData fieldName = elem.fieldNameStringData();
+        if (fieldName == kDocHashFieldName ||
+            fieldName.startsWith(StringData(kDocHashFieldName.toString() + "."))) {
+            return Status(ErrorCodes::CannotCreateIndex,
+                          str::stream() << "cannot create index on reserved field '"
+                                        << kDocHashFieldName
+                                        << "' - this field is used for document integrity "
+                                        << "verification and is stripped before storage");
+        }
     }
 
     std::unique_ptr<CollatorInterface> collator;
