@@ -758,9 +758,8 @@ def main():
     parser.add_argument("--output", default="/tmp/stability_v7_result.json", help="Output JSON file")
     args = parser.parse_args()
 
-    global DEFAULT_ITERATIONS, DEFAULT_WARMUP
-    DEFAULT_ITERATIONS = args.iterations
-    DEFAULT_WARMUP = args.warmup
+    iterations = args.iterations
+    warmup = args.warmup
 
     print("=" * 60)
     print("Stability Benchmark v7 - F-Scheme E2E Test")
