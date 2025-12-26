@@ -63,8 +63,9 @@ BtreeAccessMethod::BtreeAccessMethod(IndexCatalogEntry* btreeState, SortedDataIn
 
 void BtreeAccessMethod::doGetKeys(const BSONObj& obj,
                                   BSONObjSet* keys,
-                                  MultikeyPaths* multikeyPaths) const {
-    _keyGenerator->getKeys(obj, keys, multikeyPaths);
+                                  MultikeyPaths* multikeyPaths,
+                                  FieldOffsetCache* cache) const {
+    _keyGenerator->getKeys(obj, keys, multikeyPaths, cache);
 }
 
 }  // namespace mongo
