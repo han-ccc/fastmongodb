@@ -48,6 +48,7 @@ class BSONObjBuilder;
 class MatchExpression;
 class UpdateTicket;
 struct InsertDeleteOptions;
+struct FieldOffsetCache;
 
 /**
  * An IndexAccessMethod is the interface through which all the mutation, lookup, and
@@ -82,7 +83,8 @@ public:
                   const BSONObj& obj,
                   const RecordId& loc,
                   const InsertDeleteOptions& options,
-                  int64_t* numInserted);
+                  int64_t* numInserted,
+                  FieldOffsetCache* cache = nullptr);
 
     /**
      * Analogous to above, but remove the records instead of inserting them.
@@ -205,7 +207,8 @@ public:
                       const BSONObj& obj,
                       const RecordId& loc,
                       const InsertDeleteOptions& options,
-                      int64_t* numInserted);
+                      int64_t* numInserted,
+                      FieldOffsetCache* cache = nullptr);
 
     private:
         friend class IndexAccessMethod;
@@ -276,7 +279,8 @@ public:
     void getKeys(const BSONObj& obj,
                  GetKeysMode mode,
                  BSONObjSet* keys,
-                 MultikeyPaths* multikeyPaths) const;
+                 MultikeyPaths* multikeyPaths,
+                 FieldOffsetCache* cache = nullptr) const;
 
     /**
      * Splits the sets 'left' and 'right' into two vectors, the first containing the elements that
@@ -301,7 +305,8 @@ protected:
      */
     virtual void doGetKeys(const BSONObj& obj,
                            BSONObjSet* keys,
-                           MultikeyPaths* multikeyPaths) const = 0;
+                           MultikeyPaths* multikeyPaths,
+                           FieldOffsetCache* cache = nullptr) const = 0;
 
     /**
      * Determines whether it's OK to ignore ErrorCodes::KeyTooLong for this OperationContext

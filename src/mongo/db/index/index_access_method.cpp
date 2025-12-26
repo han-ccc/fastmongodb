@@ -125,13 +125,14 @@ Status IndexAccessMethod::insert(OperationContext* txn,
                                  const BSONObj& obj,
                                  const RecordId& loc,
                                  const InsertDeleteOptions& options,
-                                 int64_t* numInserted) {
+                                 int64_t* numInserted,
+                                 FieldOffsetCache* cache) {
     invariant(numInserted);
     *numInserted = 0;
     BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     MultikeyPaths multikeyPaths;
     // Delegate to the subclass.
-    getKeys(obj, options.getKeysMode, &keys, &multikeyPaths);
+    getKeys(obj, options.getKeysMode, &keys, &multikeyPaths, cache);
 
     Status ret = Status::OK();
     for (BSONObjSet::const_iterator i = keys.begin(); i != keys.end(); ++i) {
@@ -423,11 +424,12 @@ Status IndexAccessMethod::BulkBuilder::insert(OperationContext* txn,
                                               const BSONObj& obj,
                                               const RecordId& loc,
                                               const InsertDeleteOptions& options,
-                                              int64_t* numInserted) {
+                                              int64_t* numInserted,
+                                              FieldOffsetCache* cache) {
     BSONObjSet keys = SimpleBSONObjComparator::kInstance.makeBSONObjSet();
     MultikeyPaths multikeyPaths;
 
-    _real->getKeys(obj, options.getKeysMode, &keys, &multikeyPaths);
+    _real->getKeys(obj, options.getKeysMode, &keys, &multikeyPaths, cache);
 
     _everGeneratedMultipleKeys = _everGeneratedMultipleKeys || (keys.size() > 1);
 
@@ -543,7 +545,8 @@ Status IndexAccessMethod::commitBulk(OperationContext* txn,
 void IndexAccessMethod::getKeys(const BSONObj& obj,
                                 GetKeysMode mode,
                                 BSONObjSet* keys,
-                                MultikeyPaths* multikeyPaths) const {
+                                MultikeyPaths* multikeyPaths,
+                                FieldOffsetCache* cache) const {
     static stdx::unordered_set<int> whiteList{ErrorCodes::CannotBuildIndexKeys,
                                               // Btree
                                               ErrorCodes::KeyTooLong,
@@ -567,7 +570,7 @@ void IndexAccessMethod::getKeys(const BSONObj& obj,
                                               13026,
                                               13027};
     try {
-        doGetKeys(obj, keys, multikeyPaths);
+        doGetKeys(obj, keys, multikeyPaths, cache);
     } catch (const UserException& ex) {
         if (mode == GetKeysMode::kEnforceConstraints) {
             throw;

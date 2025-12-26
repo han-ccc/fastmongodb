@@ -45,6 +45,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/exec/working_set_common.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/db/index/btree_key_generator.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/replication_coordinator_global.h"
 #include "mongo/db/server_parameters.h"
@@ -400,6 +401,10 @@ Status MultiIndexBlock::insertAllDocumentsInCollection(std::set<RecordId>* dupsO
 }
 
 Status MultiIndexBlock::insert(const BSONObj& doc, const RecordId& loc) {
+    // On-demand cache: only create when multiple indexes exist (single-index tables have zero overhead)
+    FieldOffsetCache cache;
+    FieldOffsetCache* cachePtr = (_indexes.size() > 1) ? &cache : nullptr;
+
     for (size_t i = 0; i < _indexes.size(); i++) {
         if (_indexes[i].filterExpression && !_indexes[i].filterExpression->matchesBSON(doc)) {
             continue;
@@ -408,9 +413,9 @@ Status MultiIndexBlock::insert(const BSONObj& doc, const RecordId& loc) {
         int64_t unused;
         Status idxStatus(ErrorCodes::InternalError, "");
         if (_indexes[i].bulk) {
-            idxStatus = _indexes[i].bulk->insert(_txn, doc, loc, _indexes[i].options, &unused);
+            idxStatus = _indexes[i].bulk->insert(_txn, doc, loc, _indexes[i].options, &unused, cachePtr);
         } else {
-            idxStatus = _indexes[i].real->insert(_txn, doc, loc, _indexes[i].options, &unused);
+            idxStatus = _indexes[i].real->insert(_txn, doc, loc, _indexes[i].options, &unused, cachePtr);
         }
 
         if (!idxStatus.isOK())
