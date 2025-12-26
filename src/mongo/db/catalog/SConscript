@@ -19,6 +19,28 @@ env.Library(
 )
 
 env.Library(
+    target='document_integrity',
+    source=[
+        "document_integrity.cpp",
+    ],
+    LIBDEPS=[
+        "$BUILD_DIR/mongo/base",
+        "$BUILD_DIR/mongo/db/server_parameters",
+        "$BUILD_DIR/third_party/xxhash/xxhash",
+    ],
+)
+
+env.CppUnitTest(
+    target='document_integrity_test',
+    source=[
+        'document_integrity_test.cpp',
+    ],
+    LIBDEPS=[
+        'document_integrity',
+    ],
+)
+
+env.Library(
     target='index_key_validate',
     source=[
         "index_key_validate.cpp",

@@ -37,6 +37,7 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/catalog/database_holder.h"
+#include "mongo/db/catalog/document_integrity.h"
 #include "mongo/db/catalog/document_validation.h"
 #include "mongo/db/commands.h"
 #include "mongo/db/concurrency/write_conflict_exception.h"
@@ -441,13 +442,38 @@ WriteResult performInserts(OperationContext* txn, const InsertOp& wholeOp) {
 
     for (auto&& doc : wholeOp.documents) {
         const bool isLastDoc = (&doc == &wholeOp.documents.back());
-        auto fixedDoc = fixDocumentForInsert(doc);
-        if (!fixedDoc.isOK()) {
+
+        // Optimized integrity check: single pass for _$docHash validation
+        // If document has _$docHash, it MUST pass verification (prevents manual insertion)
+        Status integrityStatus = Status::OK();
+        BSONObj docToInsert = doc;
+
+        if (doc.hasField(kDocHashFieldName)) {
+            // Document has hash field - must verify (regardless of global setting)
+            // This both validates the reserved field and checks integrity in one pass
+            integrityStatus = verifyDocumentIntegrity(doc);
+            if (integrityStatus.isOK()) {
+                // Valid hash - strip before insertion
+                docToInsert = stripHashField(doc);
+            }
+            // If not OK, integrityStatus contains the error
+        }
+        // No hash field - normal processing (verifyDocumentIntegrity returns OK for missing hash)
+
+        StatusWith<BSONObj> fixedDoc = Status::OK();
+        if (integrityStatus.isOK()) {
+            fixedDoc = fixDocumentForInsert(docToInsert);
+        }
+
+        if (!integrityStatus.isOK()) {
+            // Integrity verification failed - handled after batch insert for correct ordering
+        } else if (!fixedDoc.isOK()) {
             // Handled after we insert anything in the batch to be sure we report errors in the
             // correct order. In an ordered insert, if one of the docs ahead of us fails, we should
             // behave as-if we never got to this document.
         } else {
-            batch.push_back(fixedDoc.getValue().isEmpty() ? doc : std::move(fixedDoc.getValue()));
+            batch.push_back(fixedDoc.getValue().isEmpty() ? docToInsert
+                                                          : std::move(fixedDoc.getValue()));
             bytesInBatch += batch.back().objsize();
             if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < insertVectorMaxBytes)
                 continue;  // Add more to batch before inserting.
@@ -457,7 +483,15 @@ WriteResult performInserts(OperationContext* txn, const InsertOp& wholeOp) {
         batch.clear();  // We won't need the current batch any more.
         bytesInBatch = 0;
 
-        if (canContinue && !fixedDoc.isOK()) {
+        // Handle integrity error (includes reserved field validation)
+        if (canContinue && !integrityStatus.isOK()) {
+            globalOpCounters.gotInsert();
+            canContinue = handleError(
+                txn,
+                UserException(integrityStatus.code(), integrityStatus.reason()),
+                wholeOp,
+                &out);
+        } else if (canContinue && !fixedDoc.isOK()) {
             globalOpCounters.gotInsert();
             canContinue = handleError(
                 txn,
@@ -488,12 +522,21 @@ static WriteResult::SingleResult performSingleUpdateOp(OperationContext* txn,
         curOp.ensureStarted();
     }
 
+    // Document integrity verification for update spec (both replacement and modifier updates)
+    // If update spec has hash field, verify it (always reject on failure)
+    BSONObj updateSpec = op.update;
+    if (updateSpec.hasField(kDocHashFieldName)) {
+        uassertStatusOK(verifyDocumentIntegrity(updateSpec));
+        // Strip hash field from update spec before processing
+        updateSpec = stripHashField(updateSpec);
+    }
+
     UpdateLifecycleImpl updateLifecycle(ns);
     UpdateRequest request(ns);
     request.setLifecycle(&updateLifecycle);
     request.setQuery(op.query);
     request.setCollation(op.collation);
-    request.setUpdates(op.update);
+    request.setUpdates(updateSpec);
     request.setMulti(op.multi);
     request.setUpsert(op.upsert);
     request.setYieldPolicy(PlanExecutor::YIELD_AUTO);  // ParsedUpdate overrides this for $isolated.

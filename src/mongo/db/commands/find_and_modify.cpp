@@ -65,6 +65,7 @@
 #include "mongo/db/s/collection_sharding_state.h"
 #include "mongo/db/stats/top.h"
 #include "mongo/db/write_concern.h"
+#include "mongo/db/catalog/document_integrity.h"
 #include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
@@ -141,7 +142,17 @@ void makeUpdateRequest(const FindAndModifyRequest& args,
                        UpdateRequest* requestOut) {
     requestOut->setQuery(args.getQuery());
     requestOut->setProj(args.getFields());
-    requestOut->setUpdates(args.getUpdateObj());
+
+    // Document integrity verification for update spec (both replacement and modifier updates)
+    // If update spec has hash field, verify it (always reject on failure)
+    BSONObj updateSpec = args.getUpdateObj();
+    if (updateSpec.hasField(kDocHashFieldName)) {
+        uassertStatusOK(verifyDocumentIntegrity(updateSpec));
+        // Strip hash field from update spec before processing
+        updateSpec = stripHashField(updateSpec);
+    }
+    requestOut->setUpdates(updateSpec);
+
     requestOut->setSort(args.getSort());
     requestOut->setCollation(args.getCollation());
     requestOut->setUpsert(args.isUpsert());
