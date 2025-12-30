@@ -50,32 +50,37 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
     <title>Claude Code 对话记录</title>
     <style>
         :root {
-            --bg-dark: #1a1a2e;
-            --bg-card: #16213e;
-            --bg-sidebar: #0f0f1a;
-            --text-primary: #eee;
-            --text-dim: #888;
-            --accent-green: #4ade80;
-            --accent-cyan: #22d3ee;
-            --accent-yellow: #fbbf24;
-            --accent-magenta: #e879f9;
-            --accent-red: #f87171;
-            --accent-blue: #60a5fa;
-            --sidebar-width: 320px;
+            --bg-main: #ffffff;
+            --bg-sidebar: #f8f9fa;
+            --bg-card: #f1f3f4;
+            --bg-code: #f6f8fa;
+            --text-primary: #1f2937;
+            --text-secondary: #4b5563;
+            --text-dim: #6b7280;
+            --border-color: #e5e7eb;
+            --accent-green: #059669;
+            --accent-green-bg: #d1fae5;
+            --accent-cyan: #0891b2;
+            --accent-cyan-bg: #cffafe;
+            --accent-yellow: #d97706;
+            --accent-magenta: #9333ea;
+            --accent-red: #dc2626;
+            --accent-blue: #2563eb;
+            --sidebar-width: 300px;
         }
         * { box-sizing: border-box; }
         body {
             font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
-            background: var(--bg-dark);
+            background: var(--bg-main);
             color: var(--text-primary);
             margin: 0;
             padding: 0;
-            line-height: 1.6;
-            font-size: 15px;
+            line-height: 1.8;
+            font-size: 16px;
         }
         code, .code-block, .table-row, .tool-result {
             font-family: 'SF Mono', 'Consolas', 'Monaco', 'Menlo', monospace;
-            font-size: 13px;
+            font-size: 14px;
         }
         .layout {
             display: flex;
@@ -84,26 +89,26 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .sidebar {
             width: var(--sidebar-width);
             background: var(--bg-sidebar);
-            border-right: 1px solid #2a2a4a;
+            border-right: 1px solid var(--border-color);
             position: fixed;
             top: 0;
             left: 0;
             height: 100vh;
             overflow-y: auto;
-            padding: 20px;
+            padding: 20px 15px;
         }
         .sidebar h2 {
             font-size: 14px;
-            color: var(--accent-cyan);
+            color: var(--text-secondary);
             margin: 0 0 15px 0;
             padding-bottom: 10px;
-            border-bottom: 1px solid #2a2a4a;
+            border-bottom: 1px solid var(--border-color);
         }
         .toc-item {
             display: block;
-            padding: 8px 12px;
+            padding: 10px 12px;
             margin: 4px 0;
-            border-radius: 6px;
+            border-radius: 8px;
             text-decoration: none;
             color: var(--text-primary);
             font-size: 13px;
@@ -111,30 +116,34 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             border-left: 3px solid transparent;
         }
         .toc-item:hover {
-            background: rgba(255,255,255,0.05);
+            background: rgba(0,0,0,0.04);
         }
         .toc-item.user {
             border-left-color: var(--accent-green);
-            background: rgba(16, 185, 129, 0.1);
+            background: var(--accent-green-bg);
+            font-weight: 500;
         }
         .toc-item.user:hover {
-            background: rgba(16, 185, 129, 0.2);
+            background: #a7f3d0;
         }
         .toc-item.claude {
             border-left-color: var(--accent-cyan);
             color: var(--text-dim);
             font-size: 12px;
             padding-left: 20px;
+            background: transparent;
         }
         .toc-item.claude:hover {
-            background: rgba(34, 211, 238, 0.1);
+            background: var(--accent-cyan-bg);
             color: var(--text-primary);
         }
         .toc-label {
             font-size: 10px;
-            font-weight: bold;
-            opacity: 0.7;
-            margin-bottom: 2px;
+            font-weight: 600;
+            color: var(--accent-green);
+            margin-bottom: 3px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         .toc-text {
             display: -webkit-box;
@@ -145,49 +154,55 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .main-content {
             margin-left: var(--sidebar-width);
             flex: 1;
-            padding: 20px;
+            padding: 30px 40px;
         }
         .container {
-            max-width: 900px;
+            max-width: 800px;
             margin: 0 auto;
         }
         .header {
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            padding: 20px 30px;
+            color: white;
+            padding: 25px 30px;
             border-radius: 12px;
-            margin-bottom: 20px;
-            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            margin-bottom: 30px;
+            box-shadow: 0 4px 15px rgba(102, 126, 234, 0.3);
         }
         .header h1 {
             margin: 0;
-            font-size: 24px;
+            font-size: 22px;
+            font-weight: 600;
         }
         .header .meta {
-            color: rgba(255,255,255,0.8);
-            font-size: 12px;
+            color: rgba(255,255,255,0.85);
+            font-size: 13px;
             margin-top: 8px;
         }
         .user-block {
-            background: linear-gradient(135deg, #059669 0%, #10b981 100%);
+            background: var(--accent-green-bg);
+            border: 1px solid #a7f3d0;
             border-radius: 12px;
-            padding: 15px 20px;
-            margin: 20px 0;
-            box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+            padding: 16px 20px;
+            margin: 25px 0 15px 0;
             scroll-margin-top: 20px;
         }
         .user-block .label {
-            font-size: 12px;
-            font-weight: bold;
-            opacity: 0.9;
+            font-size: 11px;
+            font-weight: 600;
+            color: var(--accent-green);
             margin-bottom: 8px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
         }
         .user-block .content {
-            font-size: 16px;
+            font-size: 17px;
+            color: #065f46;
+            font-weight: 500;
         }
         .claude-block {
             background: var(--bg-card);
-            border-left: 4px solid var(--accent-cyan);
-            padding: 12px 20px;
+            border-left: 3px solid var(--accent-cyan);
+            padding: 12px 18px;
             margin: 8px 0;
             border-radius: 0 8px 8px 0;
         }
@@ -195,6 +210,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             display: flex;
             align-items: center;
             gap: 8px;
+            font-size: 14px;
         }
         .tool-call .icon { font-size: 16px; }
         .tool-call.file { color: var(--accent-yellow); }
@@ -203,67 +219,73 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         .tool-call.other { color: var(--accent-cyan); }
         .tool-result {
             color: var(--text-dim);
-            padding-left: 28px;
-            font-size: 13px;
+            padding-left: 24px;
+            font-size: 12px;
+            border-left: 2px solid var(--border-color);
+            margin-left: 8px;
         }
         .diff-add {
-            color: var(--accent-green);
-            background: rgba(74, 222, 128, 0.1);
+            color: #166534;
+            background: #dcfce7;
             padding: 2px 8px;
             border-radius: 4px;
             display: inline-block;
+            font-family: monospace;
+            font-size: 13px;
         }
         .diff-del {
-            color: var(--accent-red);
-            background: rgba(248, 113, 113, 0.1);
+            color: #991b1b;
+            background: #fee2e2;
             padding: 2px 8px;
             border-radius: 4px;
             display: inline-block;
+            font-family: monospace;
+            font-size: 13px;
         }
         .code-block {
-            background: #0d1117;
+            background: var(--bg-code);
+            border: 1px solid var(--border-color);
             border-radius: 8px;
             padding: 15px;
             margin: 10px 0;
             overflow-x: auto;
-            border: 1px solid #30363d;
         }
         .table-row {
-            color: var(--accent-cyan);
+            color: var(--text-secondary);
+            background: var(--bg-code);
+            padding: 4px 8px;
+            border-radius: 4px;
+            margin: 2px 0;
+            display: block;
         }
         .separator {
-            color: var(--accent-magenta);
+            color: var(--text-dim);
             text-align: center;
-            margin: 15px 0;
+            margin: 20px 0;
+            font-size: 13px;
         }
         .task-complete {
             color: var(--accent-green);
+            font-weight: 500;
         }
         .text-content {
-            padding: 8px 0;
+            padding: 6px 0;
             white-space: pre-wrap;
             word-wrap: break-word;
+            color: var(--text-secondary);
+            line-height: 1.8;
         }
         .diff-summary {
             color: var(--text-dim);
             font-style: italic;
-            padding: 8px 20px;
+            padding: 8px 16px;
+            background: var(--bg-code);
+            border-radius: 6px;
+            margin: 8px 0;
+            font-size: 13px;
         }
-        .diff-summary .add { color: var(--accent-green); }
-        .diff-summary .del { color: var(--accent-red); }
-        .collapsed {
-            cursor: pointer;
-            user-select: none;
-        }
-        .collapsed:hover {
-            opacity: 0.8;
-        }
-        .code-inline {
-            background: #0d1117;
-            padding: 2px 6px;
-            border-radius: 4px;
-            font-family: monospace;
-        }
+        .diff-summary .add { color: #166534; font-weight: 500; }
+        .diff-summary .del { color: #991b1b; font-weight: 500; }
         .section-anchor {
             scroll-margin-top: 20px;
         }
@@ -273,6 +295,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             }
             .main-content {
                 margin-left: 0;
+                padding: 20px;
             }
         }
     </style>
