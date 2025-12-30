@@ -63,13 +63,17 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
         * { box-sizing: border-box; }
         body {
-            font-family: 'SF Mono', 'Consolas', 'Monaco', monospace;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', Arial, sans-serif;
             background: var(--bg-dark);
             color: var(--text-primary);
             margin: 0;
             padding: 20px;
             line-height: 1.6;
-            font-size: 14px;
+            font-size: 15px;
+        }
+        code, .code-block, .table-row, .tool-result {
+            font-family: 'SF Mono', 'Consolas', 'Monaco', 'Menlo', monospace;
+            font-size: 13px;
         }
         .container {
             max-width: 1200px;
@@ -153,7 +157,6 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         }
         .table-row {
             color: var(--accent-cyan);
-            font-family: monospace;
         }
         .separator {
             color: var(--accent-magenta);
