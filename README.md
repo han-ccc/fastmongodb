@@ -191,12 +191,80 @@ scons build/unittests/large_scale_coalescer_test
 - RocksDB: 5.1.2
 - mongo-rocks: 适配版本
 
+## 新增特性
+
+### 文档完整性校验 (Document Integrity Verification)
+
+端到端文档完整性校验：客户端计算 xxHash64，服务端写入时校验，hash 不匹配则拒绝写入。
+
+```java
+// Java Driver 示例
+VerifiedDocument doc = new VerifiedDocument("name", "test");
+doc.put("value", 123);
+doc.lock();  // 计算 hash 并冻结文档
+collection.insertOne(doc);  // 自动携带 _$docHash，服务端校验
+```
+
+```bash
+# 启用校验
+mongod --setParameter documentIntegrityVerification=true
+```
+
+| 场景 | 行为 |
+|------|------|
+| 文档无 `_$docHash` | 正常写入，不校验 |
+| hash 校验通过 | 剥离 hash 字段后写入 |
+| hash 校验失败 | 拒绝写入，返回 `DocumentIntegrityError` |
+
+详见 [文档完整性校验设计](DOCUMENT_INTEGRITY_FEATURE.md)
+
+## 新增命令
+
+### repairIndexEntry - 索引修复命令
+
+用于修复索引与文档不一致的问题：
+
+```javascript
+// 添加缺失的索引条目
+db.adminCommand({
+    repairIndexEntry: "users",
+    action: "insert",
+    indexName: "email_1",
+    _id: ObjectId("...")
+})
+
+// 删除孤儿索引条目
+db.adminCommand({
+    repairIndexEntry: "products",
+    action: "remove",
+    indexName: "category_1",
+    indexKey: { category: "electronics" },
+    recordId: NumberLong(12345678)
+})
+```
+
+详见 [repairIndexEntry 设计文档](REPAIR_INDEX_ENTRY_DESIGN.md)
+
+## 工具
+
+### 对话展示工具
+
+用于导出和展示开发对话记录：
+
+```bash
+# 文本格式显示
+python tools/conversation/show_conversation.py session.txt
+
+# 导出为 HTML（支持侧边栏目录）
+python tools/conversation/show_conversation.py session.txt --html -o output.html
+```
+
 ## 分支说明
 
 | 分支 | 说明 |
 |-----|------|
-| `perf/baseline` | 主优化分支，包含所有性能优化 |
-| `master` | 原始 MongoDB 3.4.2 代码 |
+| `main` | 主分支，包含所有性能优化和新特性 |
+| `master` | 原始 MongoDB 3.4.2 代码（来自官方仓库） |
 
 ## License
 
