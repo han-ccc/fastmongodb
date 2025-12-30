@@ -59,6 +59,7 @@ env.Library(
         'move_timing_helper.cpp',
         'operation_sharding_state.cpp',
         'shard_identity_rollback_notifier.cpp',
+        'shard_key_lock.cpp',
         'sharded_connection_info.cpp',
         'sharding_initialization_mongod.cpp',
         'sharding_state.cpp',
@@ -236,6 +237,17 @@ env.CppUnitTest(
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_client_impl',
         '$BUILD_DIR/mongo/s/catalog/sharding_catalog_mock',
         '$BUILD_DIR/mongo/s/sharding_mongod_test_fixture',
+    ],
+)
+
+env.CppUnitTest(
+    target='shard_key_lock_test',
+    source=[
+        'shard_key_lock_test.cpp',
+    ],
+    LIBDEPS=[
+        '$BUILD_DIR/mongo/base',
+        'sharding',
     ],
 )
 

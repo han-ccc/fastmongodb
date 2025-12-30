@@ -293,6 +293,14 @@ public:
     static std::pair<std::vector<BSONObj>, std::vector<BSONObj>> setDifference(
         const BSONObjSet& left, const BSONObjSet& right);
 
+    /**
+     * Removes a single index key entry. Used for repairing orphan index entries.
+     */
+    void removeSingleKey(OperationContext* txn,
+                         const BSONObj& key,
+                         const RecordId& loc,
+                         bool dupsAllowed);
+
 protected:
     /**
      * Fills 'keys' with the keys that should be generated for 'obj' on this index.

@@ -81,6 +81,7 @@
 "renameCollection",  # Not used for permissions checks, but to id the event in logs.
 "renameCollectionSameDB",
 "repairDatabase",
+"repairIndexEntry",
 "replSetConfigure",
 "replSetGetConfig",
 "replSetGetStatus",

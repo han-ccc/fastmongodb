@@ -189,6 +189,13 @@ void IndexAccessMethod::removeOneKey(OperationContext* txn,
     }
 }
 
+void IndexAccessMethod::removeSingleKey(OperationContext* txn,
+                                        const BSONObj& key,
+                                        const RecordId& loc,
+                                        bool dupsAllowed) {
+    removeOneKey(txn, key, loc, dupsAllowed);
+}
+
 std::unique_ptr<SortedDataInterface::Cursor> IndexAccessMethod::newCursor(OperationContext* txn,
                                                                           bool isForward) const {
     return _newInterface->newCursor(txn, isForward);
