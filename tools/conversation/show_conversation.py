@@ -41,7 +41,7 @@ class Colors:
     BG_BLUE = '\033[44m'
     BG_GREEN = '\033[42m'
 
-# HTML 模板 - 使用 $filename 和 $content 占位符
+# HTML 模板 - 使用 $filename, $content, $toc 占位符
 HTML_TEMPLATE = '''<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -52,6 +52,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
         :root {
             --bg-dark: #1a1a2e;
             --bg-card: #16213e;
+            --bg-sidebar: #0f0f1a;
             --text-primary: #eee;
             --text-dim: #888;
             --accent-green: #4ade80;
@@ -60,6 +61,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             --accent-magenta: #e879f9;
             --accent-red: #f87171;
             --accent-blue: #60a5fa;
+            --sidebar-width: 320px;
         }
         * { box-sizing: border-box; }
         body {
@@ -67,7 +69,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             background: var(--bg-dark);
             color: var(--text-primary);
             margin: 0;
-            padding: 20px;
+            padding: 0;
             line-height: 1.6;
             font-size: 15px;
         }
@@ -75,8 +77,78 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             font-family: 'SF Mono', 'Consolas', 'Monaco', 'Menlo', monospace;
             font-size: 13px;
         }
+        .layout {
+            display: flex;
+            min-height: 100vh;
+        }
+        .sidebar {
+            width: var(--sidebar-width);
+            background: var(--bg-sidebar);
+            border-right: 1px solid #2a2a4a;
+            position: fixed;
+            top: 0;
+            left: 0;
+            height: 100vh;
+            overflow-y: auto;
+            padding: 20px;
+        }
+        .sidebar h2 {
+            font-size: 14px;
+            color: var(--accent-cyan);
+            margin: 0 0 15px 0;
+            padding-bottom: 10px;
+            border-bottom: 1px solid #2a2a4a;
+        }
+        .toc-item {
+            display: block;
+            padding: 8px 12px;
+            margin: 4px 0;
+            border-radius: 6px;
+            text-decoration: none;
+            color: var(--text-primary);
+            font-size: 13px;
+            transition: background 0.2s;
+            border-left: 3px solid transparent;
+        }
+        .toc-item:hover {
+            background: rgba(255,255,255,0.05);
+        }
+        .toc-item.user {
+            border-left-color: var(--accent-green);
+            background: rgba(16, 185, 129, 0.1);
+        }
+        .toc-item.user:hover {
+            background: rgba(16, 185, 129, 0.2);
+        }
+        .toc-item.claude {
+            border-left-color: var(--accent-cyan);
+            color: var(--text-dim);
+            font-size: 12px;
+            padding-left: 20px;
+        }
+        .toc-item.claude:hover {
+            background: rgba(34, 211, 238, 0.1);
+            color: var(--text-primary);
+        }
+        .toc-label {
+            font-size: 10px;
+            font-weight: bold;
+            opacity: 0.7;
+            margin-bottom: 2px;
+        }
+        .toc-text {
+            display: -webkit-box;
+            -webkit-line-clamp: 2;
+            -webkit-box-orient: vertical;
+            overflow: hidden;
+        }
+        .main-content {
+            margin-left: var(--sidebar-width);
+            flex: 1;
+            padding: 20px;
+        }
         .container {
-            max-width: 1200px;
+            max-width: 900px;
             margin: 0 auto;
         }
         .header {
@@ -101,6 +173,7 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             padding: 15px 20px;
             margin: 20px 0;
             box-shadow: 0 4px 15px rgba(16, 185, 129, 0.3);
+            scroll-margin-top: 20px;
         }
         .user-block .label {
             font-size: 12px;
@@ -191,16 +264,35 @@ HTML_TEMPLATE = '''<!DOCTYPE html>
             border-radius: 4px;
             font-family: monospace;
         }
+        .section-anchor {
+            scroll-margin-top: 20px;
+        }
+        @media (max-width: 1024px) {
+            .sidebar {
+                display: none;
+            }
+            .main-content {
+                margin-left: 0;
+            }
+        }
     </style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>📜 Claude Code 对话记录</h1>
-            <div class="meta">文件: $filename</div>
-        </div>
-        <div class="content">
+    <div class="layout">
+        <nav class="sidebar">
+            <h2>📑 目录</h2>
+$toc
+        </nav>
+        <div class="main-content">
+            <div class="container">
+                <div class="header">
+                    <h1>📜 Claude Code 对话记录</h1>
+                    <div class="meta">文件: $filename</div>
+                </div>
+                <div class="content">
 $content
+                </div>
+            </div>
         </div>
     </div>
 </body>
@@ -258,12 +350,20 @@ def classify_line(line):
 
     return 'text', line.rstrip()
 
-def to_html_line(line_type, content):
+def summarize_text(text, max_len=50):
+    """截取文本摘要"""
+    text = text.strip()
+    if len(text) > max_len:
+        return text[:max_len] + '...'
+    return text
+
+def to_html_line(line_type, content, section_id=None):
     """转换单行为 HTML"""
     escaped = escape_html(content)
 
     if line_type == 'user':
-        return f'''        <div class="user-block">
+        id_attr = f' id="section-{section_id}"' if section_id else ''
+        return f'''        <div class="user-block"{id_attr}>
             <div class="label">👤 USER</div>
             <div class="content">{escaped}</div>
         </div>'''
@@ -312,12 +412,31 @@ def to_html_line(line_type, content):
 def convert_to_html(lines, filename, compact=False):
     """转换为 HTML"""
     html_lines = []
+    toc_items = []
     i = 0
     n = len(lines)
     diff_count = 0
     diff_adds = 0
     diff_dels = 0
     in_diff = False
+    section_id = 0
+    current_user_question = None
+    claude_response_buffer = []
+
+    def flush_claude_response():
+        """将 Claude 回复总结加入目录"""
+        nonlocal claude_response_buffer
+        if claude_response_buffer and current_user_question is not None:
+            # 提取有意义的回复内容（跳过工具调用）
+            meaningful = []
+            for resp_type, resp_content in claude_response_buffer:
+                if resp_type == 'text' and resp_content.strip():
+                    meaningful.append(resp_content.strip())
+            if meaningful:
+                summary = summarize_text(' '.join(meaningful)[:100], 60)
+                if summary:
+                    toc_items.append(('claude', current_user_question, summary))
+        claude_response_buffer = []
 
     while i < n:
         line = lines[i]
@@ -345,16 +464,42 @@ def convert_to_html(lines, filename, compact=False):
             i += 1
             continue
 
-        html_lines.append(to_html_line(line_type, content))
+        # 用户问题 - 新的 section
+        if line_type == 'user':
+            flush_claude_response()
+            section_id += 1
+            current_user_question = section_id
+            summary = summarize_text(content, 40)
+            toc_items.append(('user', section_id, summary))
+            html_lines.append(to_html_line(line_type, content, section_id))
+        else:
+            # 记录 Claude 回复用于总结
+            if line_type == 'text':
+                claude_response_buffer.append((line_type, content))
+            html_lines.append(to_html_line(line_type, content))
+
         i += 1
 
     # 最后的 diff 统计
     if in_diff and diff_count > 0:
         html_lines.append(f'        <div class="diff-summary">... [{diff_count} 行差异: <span class="add">+{diff_adds}</span>, <span class="del">-{diff_dels}</span>]</div>')
 
+    flush_claude_response()
+
+    # 生成目录 HTML
+    toc_html_lines = []
+    for item in toc_items:
+        if item[0] == 'user':
+            _, sid, summary = item
+            toc_html_lines.append(f'            <a href="#section-{sid}" class="toc-item user"><div class="toc-label">👤 问题</div><div class="toc-text">{escape_html(summary)}</div></a>')
+        else:
+            _, sid, summary = item
+            toc_html_lines.append(f'            <a href="#section-{sid}" class="toc-item claude"><div class="toc-text">↳ {escape_html(summary)}</div></a>')
+
     return Template(HTML_TEMPLATE).substitute(
         filename=escape_html(filename),
-        content='\n'.join(html_lines)
+        content='\n'.join(html_lines),
+        toc='\n'.join(toc_html_lines)
     )
 
 def colorize_line(line, compact=False):
