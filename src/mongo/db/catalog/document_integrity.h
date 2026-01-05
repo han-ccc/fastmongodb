@@ -20,10 +20,11 @@ namespace mongo {
 constexpr StringData kDocHashFieldName = "_$docHash"_sd;
 
 /**
- * Compute xxHash64 of a BSON document, excluding the _$docHash field itself.
+ * Compute CRC32C of a BSON document, excluding the _$docHash field itself.
+ * Uses RocksDB's hardware-accelerated CRC32C (SSE4.2) when available.
  *
  * @param doc The BSON document to hash
- * @return The 64-bit hash value
+ * @return The 32-bit CRC32C hash value (stored as uint64_t for API compatibility)
  */
 uint64_t computeDocumentHash(const BSONObj& doc);
 

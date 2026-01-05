@@ -28,7 +28,10 @@
 
 #pragma once
 
+#include <deque>
 #include <memory>
+
+#include <boost/optional.hpp>
 
 #include "mongo/base/disallow_copying.h"
 #include "mongo/base/status.h"
@@ -359,6 +362,54 @@ public:
      */
     Microseconds getRemainingMaxTimeMicros() const;
 
+    //
+    // Document Integrity Verification - WAL-level hash check
+    //
+
+    /**
+     * Pushes an expected document hash for WAL-level integrity verification.
+     * For documents with hash field, push the computed hash.
+     * For documents without hash field, push boost::none to keep queue synchronized.
+     */
+    void pushExpectedDocHash(uint64_t hash) {
+        _expectedDocHashes.push_back(hash);
+    }
+
+    /**
+     * Pushes a placeholder (none) for documents without hash field.
+     * Keeps queue length synchronized with batch size for mixed batches.
+     */
+    void pushNoExpectedDocHash() {
+        _expectedDocHashes.push_back(boost::none);
+    }
+
+    /**
+     * Pops and returns the next expected document hash.
+     * Returns boost::none if queue is empty OR if the document had no hash field.
+     */
+    boost::optional<uint64_t> popExpectedDocHash() {
+        if (_expectedDocHashes.empty()) {
+            return boost::none;
+        }
+        auto hash = _expectedDocHashes.front();
+        _expectedDocHashes.pop_front();
+        return hash;
+    }
+
+    /**
+     * Returns true if there are pending entries in the hash queue.
+     */
+    bool hasExpectedDocHashes() const {
+        return !_expectedDocHashes.empty();
+    }
+
+    /**
+     * Clears all expected document hashes after verification or operation completion.
+     */
+    void clearExpectedDocHashes() {
+        _expectedDocHashes.clear();
+    }
+
 protected:
     OperationContext(Client* client, unsigned int opId);
 
@@ -419,6 +470,12 @@ private:
     Timer _elapsedTime;
 
     bool _writesAreReplicated = true;
+
+    // Expected document hashes for WAL-level integrity verification.
+    // Queue supports batch inserts - each document gets its hash pushed in order.
+    // boost::none entries represent documents without hash field (keeps queue synchronized).
+    // Set by upper layer after stripping _$docHash, verified before WAL write.
+    std::deque<boost::optional<uint64_t>> _expectedDocHashes;
 };
 
 class WriteUnitOfWork {

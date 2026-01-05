@@ -68,6 +68,7 @@
 #include "mongo/db/storage/wiredtiger/wiredtiger_record_store.h"
 
 #include "mongo/db/auth/user_document_parser.h"  // XXX-ANDY
+#include "mongo/db/catalog/document_integrity.h"
 #include "mongo/rpc/object_check.h"
 #include "mongo/util/fail_point.h"
 #include "mongo/util/log.h"
@@ -514,6 +515,23 @@ Status Collection::_insertDocuments(OperationContext* txn,
     std::vector<Record> records;
     records.reserve(count);
     for (auto it = begin; it != end; it++) {
+        // Pre-WAL integrity verification: ensure document wasn't corrupted after upper layer check
+        // Pop from queue to support batch inserts - each document gets its expected hash in order
+        if (isIntegrityVerificationEnabled()) {
+            auto expectedHash = txn->popExpectedDocHash();
+            if (expectedHash) {
+                uint64_t actualHash = computeDocumentHash(*it);
+                if (actualHash != *expectedHash) {
+                    // Clear remaining hashes on failure
+                    txn->clearExpectedDocHashes();
+                    return Status(ErrorCodes::DocumentIntegrityError,
+                        str::stream() << "Pre-WAL integrity verification failed. "
+                                      << "Expected hash: " << *expectedHash
+                                      << ", actual hash: " << actualHash);
+                }
+            }
+        }
+
         Record record = {RecordId(), RecordData(it->objdata(), it->objsize())};
         records.push_back(record);
     }

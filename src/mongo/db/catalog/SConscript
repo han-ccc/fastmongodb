@@ -26,7 +26,7 @@ env.Library(
     LIBDEPS=[
         "$BUILD_DIR/mongo/base",
         "$BUILD_DIR/mongo/db/server_parameters",
-        "$BUILD_DIR/third_party/xxhash/xxhash",
+        "$BUILD_DIR/third_party/crc32c/crc32c",
     ],
 )
 

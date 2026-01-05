@@ -1,0 +1,11 @@
+# -*- mode: python; -*-
+# RocksDB library wrapper - uses prebuilt librocksdb.a
+
+Import("env")
+
+# Create a pseudo-library that links the prebuilt static library
+env.StaticLibrary(
+    target='rocksdb',
+    source=[],
+    LIBS=[File('librocksdb.a')],
+)

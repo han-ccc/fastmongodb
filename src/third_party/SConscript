@@ -103,6 +103,13 @@ murmurEnv.SConscript('murmurhash3/SConscript', exports={ 'env' : murmurEnv })
 xxhashEnv = env.Clone()
 xxhashEnv.SConscript('xxhash/SConscript', exports={ 'env' : xxhashEnv })
 
+crc32cEnv = env.Clone()
+crc32cEnv.SConscript('crc32c/SConscript', exports={ 'env' : crc32cEnv })
+
+rocksdbEnv = env.Clone()
+rocksdbEnv.Append(CPPPATH=['#/src/third_party/rocksdb/include'])
+rocksdbEnv.SConscript('rocksdb/SConscript', exports={ 'env' : rocksdbEnv })
+
 
 s2Env = env.Clone()
 s2Env.InjectThirdPartyIncludePaths(libraries=['s2', 'boost'])

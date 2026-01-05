@@ -246,6 +246,74 @@ def f_scheme_reset():
 
 ---
 
+## 4. 文档完整性校验 - 哈希队列
+
+### 优化内容
+
+| 版本 | 实现方式 | Commit |
+|------|---------|--------|
+| v1 | 单值存储 `boost::optional<uint64_t>` | `3c928396bd8` |
+| v2 | 队列存储 `std::deque<uint64_t>` | `c61655d7fb0` |
+
+### 代码变更
+
+**v1 (单值)**:
+```cpp
+boost::optional<uint64_t> _expectedDocHash;
+void setExpectedDocHash(uint64_t hash) { _expectedDocHash = hash; }
+// 批量插入时只能存储最后一个哈希
+```
+
+**v2 (队列)**:
+```cpp
+std::deque<uint64_t> _expectedDocHashes;
+void pushExpectedDocHash(uint64_t hash) { _expectedDocHashes.push_back(hash); }
+uint64_t popExpectedDocHash() { /* FIFO */ }
+// 支持批量插入，每个文档独立校验
+```
+
+### 微基准测试
+
+**测试文件**: `/tmp/hash_queue_benchmark.cpp`
+
+**编译运行**:
+```bash
+g++ -O2 -std=c++11 /tmp/hash_queue_benchmark.cpp -o /tmp/hash_queue_benchmark && /tmp/hash_queue_benchmark
+```
+
+### 测试结果 (2025-12-31)
+
+#### 单文档操作
+
+| 存储方式 | 耗时 | 开销 |
+|---------|------|------|
+| 单值存储 | 0.18 ns/op | - |
+| 队列存储 | 1.09 ns/op | +0.91 ns |
+
+#### 批量文档操作
+
+| 批量大小 | 单值(仅最后) | 队列(全部) | 额外开销 |
+|---------|-------------|-----------|---------|
+| 1 | 0.18 ns | 1.63 ns | +1.45 ns |
+| 10 | 0.18 ns | 10.1 ns | +9.9 ns |
+| 100 | 0.18 ns | 115 ns | +115 ns |
+| 1000 | 0.19 ns | 1316 ns | +1316 ns |
+
+#### 队列复用（无重分配）
+
+| 场景 | 耗时 |
+|------|------|
+| 10文档批量(复用) | 10.3 ns/op |
+
+### 结论
+
+- **队列开销**: 单文档 +1ns，批量10 +10ns
+- **相对于 INSERT 延迟 (~1470us)**: 开销 < 0.001%
+- **功能收益**: 支持批量插入全文档校验（v1 只能校验最后一个）
+- **内存**: 队列复用避免频繁分配
+
+---
+
 ## 附录: 微基准测试源码
 
 ### size_by_type.cpp

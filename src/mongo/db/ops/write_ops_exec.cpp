@@ -84,6 +84,33 @@ MONGO_FP_DECLARE(failAllInserts);
 MONGO_FP_DECLARE(failAllUpdates);
 MONGO_FP_DECLARE(failAllRemoves);
 
+/**
+ * RAII guard to ensure hash queue cleanup on any exception.
+ * Clears the expected document hash queue when destroyed, unless dismissed.
+ */
+class HashQueueGuard {
+public:
+    explicit HashQueueGuard(OperationContext* txn) : _txn(txn) {}
+
+    ~HashQueueGuard() {
+        if (_txn) {
+            _txn->clearExpectedDocHashes();
+        }
+    }
+
+    // Dismiss the guard - don't clear on destruction (cleanup done manually)
+    void dismiss() {
+        _txn = nullptr;
+    }
+
+    // Non-copyable
+    HashQueueGuard(const HashQueueGuard&) = delete;
+    HashQueueGuard& operator=(const HashQueueGuard&) = delete;
+
+private:
+    OperationContext* _txn;
+};
+
 void finishCurOp(OperationContext* txn, CurOp* curOp) {
     try {
         curOp->done();
@@ -361,6 +388,9 @@ static bool insertBatchAndHandleErrors(OperationContext* txn,
         }
     } catch (const DBException& ex) {
         collection.reset();
+        // Clear hash queue - hashes were partially consumed during failed batch
+        // The one-at-a-time retry below doesn't use hash verification
+        txn->clearExpectedDocHashes();
         // Ignore this failure and behave as-if we never tried to do the combined batch insert.
         // The loop below will handle reporting any non-transient errors.
     }
@@ -440,6 +470,9 @@ WriteResult performInserts(OperationContext* txn, const InsertOp& wholeOp) {
     const size_t maxBatchSize = internalInsertMaxBatchSize;
     batch.reserve(std::min(wholeOp.documents.size(), maxBatchSize));
 
+    // RAII guard ensures hash queue cleanup on any exception (not just DBException)
+    HashQueueGuard hashQueueGuard(txn);
+
     for (auto&& doc : wholeOp.documents) {
         const bool isLastDoc = (&doc == &wholeOp.documents.back());
 
@@ -448,7 +481,8 @@ WriteResult performInserts(OperationContext* txn, const InsertOp& wholeOp) {
         Status integrityStatus = Status::OK();
         BSONObj docToInsert = doc;
 
-        if (doc.hasField(kDocHashFieldName)) {
+        bool hasHashField = doc.hasField(kDocHashFieldName);
+        if (hasHashField) {
             // Document has hash field - must verify (regardless of global setting)
             // This both validates the reserved field and checks integrity in one pass
             integrityStatus = verifyDocumentIntegrity(doc);
@@ -472,8 +506,23 @@ WriteResult performInserts(OperationContext* txn, const InsertOp& wholeOp) {
             // correct order. In an ordered insert, if one of the docs ahead of us fails, we should
             // behave as-if we never got to this document.
         } else {
-            batch.push_back(fixedDoc.getValue().isEmpty() ? docToInsert
-                                                          : std::move(fixedDoc.getValue()));
+            // Determine the actual document that will be inserted
+            BSONObj actualDoc = fixedDoc.getValue().isEmpty() ? docToInsert
+                                                              : fixedDoc.getValue();
+
+            // Set expected hash for pre-WAL verification in Collection layer
+            // Always push to queue when verification enabled to keep queue synchronized with batch
+            // Push actual hash for docs with hash field, push none for docs without
+            if (isIntegrityVerificationEnabled()) {
+                if (hasHashField) {
+                    uint64_t cleanHash = computeDocumentHash(actualDoc);
+                    txn->pushExpectedDocHash(cleanHash);
+                } else {
+                    txn->pushNoExpectedDocHash();
+                }
+            }
+
+            batch.push_back(std::move(actualDoc));
             bytesInBatch += batch.back().objsize();
             if (!isLastDoc && batch.size() < maxBatchSize && bytesInBatch < insertVectorMaxBytes)
                 continue;  // Add more to batch before inserting.
@@ -481,6 +530,7 @@ WriteResult performInserts(OperationContext* txn, const InsertOp& wholeOp) {
 
         bool canContinue = insertBatchAndHandleErrors(txn, wholeOp, batch, &lastOpFixer, &out);
         batch.clear();  // We won't need the current batch any more.
+        txn->clearExpectedDocHashes();  // Ensure hash queue is clean for next batch
         bytesInBatch = 0;
 
         // Handle integrity error (includes reserved field validation)

@@ -124,6 +124,51 @@ ps aux | grep scons
 ls -la mongod
 ```
 
+## RocksDB 本地编译
+
+本项目使用本地 RocksDB 源码，**不依赖系统库**：
+
+```
+src/third_party/rocksdb/           # RocksDB 源码
+src/third_party/rocksdb/librocksdb.a  # 预编译静态库
+src/third_party/rocksdb/include/   # RocksDB 头文件
+src/mongo/db/modules/rocks/        # MongoDB RocksDB 存储引擎模块
+```
+
+### 构建配置
+
+关键修改：
+
+1. `src/mongo/db/modules/rocks/build.py` - 添加本地头文件路径：
+   ```python
+   env.Append(CPPPATH=['#/src/third_party/rocksdb/include'])
+   ```
+
+2. `src/mongo/db/modules/rocks/SConscript` - 链接本地静态库：
+   ```python
+   SYSLIBDEPS=["z", "bz2", "pthread", "dl", "zstd",
+               env.File('#/src/third_party/rocksdb/librocksdb.a')]
+   ```
+
+### 依赖库
+
+RocksDB 静态库需要以下系统库：
+- `z` (zlib)
+- `bz2` (bzip2)
+- `pthread`
+- `dl`
+- `zstd` (Zstandard)
+- `lz4` (可选，自动检测)
+
+### 重新编译 RocksDB (如需要)
+
+```bash
+cd src/third_party/rocksdb
+make clean
+make static_lib -j24
+# 生成 librocksdb.a
+```
+
 ## 常见错误快速修复
 
 | 错误类型 | 症状 | 解决方案 |
@@ -132,3 +177,4 @@ ls -la mongod
 | redefinition | 重复定义 | 检查头文件include顺序 |
 | no such file | 找不到头文件 | 检查SConscript依赖 |
 | glibc兼容性 | 模板错误 | cherry-pick兼容性修复 |
+| rocksdb/db.h not found | rocks模块配置失败 | 确认使用本地库配置 |

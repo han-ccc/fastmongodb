@@ -14,7 +14,8 @@
 #include "mongo/util/log.h"
 #include "mongo/util/hex.h"
 
-#include "third_party/xxhash/xxhash.h"
+// Hardware-accelerated CRC32C (SSE4.2)
+#include "third_party/crc32c/crc32c.h"
 
 namespace mongo {
 
@@ -22,9 +23,16 @@ namespace mongo {
 MONGO_EXPORT_SERVER_PARAMETER(documentIntegrityVerification, bool, false);
 
 uint64_t computeDocumentHash(const BSONObj& doc) {
-    // Fast path: no hash field, hash entire document
+    // Fast path: no hash field, hash elements only (skip 4-byte header and 1-byte terminator)
+    // This matches the Python client computation: raw[4:-1]
     if (!doc.hasField(kDocHashFieldName)) {
-        return XXH64(doc.objdata(), doc.objsize(), 0);
+        const char* elements = doc.objdata() + 4;  // Skip 4-byte length header
+        size_t elementsSize = doc.objsize() - 5;   // Exclude header (4) and terminator (1)
+        if (elementsSize > 0) {
+            return mongo::crc32c::compute(elements, elementsSize);
+        } else {
+            return 0;
+        }
     }
 
     // Hybrid strategy: check if _$docHash is the first field
@@ -39,15 +47,15 @@ uint64_t computeDocumentHash(const BSONObj& doc) {
             size_t remainingSize = docEnd - afterHashElem - 1;  // -1 for terminator
 
             if (remainingSize > 0) {
-                return XXH64(afterHashElem, remainingSize, 0);
+                return mongo::crc32c::compute(afterHashElem, remainingSize);
             } else {
-                return XXH64("", 0, 0);
+                return 0;
             }
         }
     }
 
     // Compatible path: _$docHash is not first field (third-party client)
-    // Rebuild clean document and hash full BSON
+    // Rebuild clean document and hash elements only
     BSONObjBuilder builder;
     for (const auto& elem : doc) {
         if (elem.fieldNameStringData() != kDocHashFieldName) {
@@ -56,7 +64,14 @@ uint64_t computeDocumentHash(const BSONObj& doc) {
     }
     BSONObj cleanDoc = builder.obj();
 
-    return XXH64(cleanDoc.objdata(), cleanDoc.objsize(), 0);
+    // Hash elements only (skip header and terminator)
+    const char* elements = cleanDoc.objdata() + 4;
+    size_t elementsSize = cleanDoc.objsize() - 5;
+    if (elementsSize > 0) {
+        return mongo::crc32c::compute(elements, elementsSize);
+    } else {
+        return 0;
+    }
 }
 
 boost::optional<uint64_t> extractDocumentHash(const BSONObj& doc) {
